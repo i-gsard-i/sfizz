@@ -37,6 +37,17 @@
 #include <absl/algorithm/container.h>
 #include <absl/types/span.h>
 #include <random>
+#include <atomic>
+
+// --- Crackle probe (2026-06-23, OPTIMIZATION_IDEAS.md §3b): runtime-toggleable software
+// prefetch of the sample read head in the interpolation loop. Discriminates whether the
+// steady-state xruns are cold-cache *latency* (prefetch hides the miss → improves) vs raw
+// memory *bandwidth* (prefetch can't help → flat). Distance is in output samples; 0 = OFF
+// (default, so normal builds are byte-for-byte unaffected). Set via the engine probe API.
+namespace { std::atomic<int> sPrefetchDistance { 0 }; }
+extern "C" void sfizz_set_prefetch_distance(int d) {
+    sPrefetchDistance.store(d, std::memory_order_relaxed);
+}
 
 namespace sfz {
 
@@ -1367,8 +1378,11 @@ void Voice::Impl::fillInterpolated(
     auto* addingGain = addingGains.data();
     auto leftSource = source.getConstSpan(0);
     auto left = dest.getChannel(0);
+    const int pf = sPrefetchDistance.load(std::memory_order_relaxed);  // crackle probe
     if (source.getNumChannels() == 1) {
         while (ind < indices.end()) {
+            if (pf && ind + pf < indices.end())
+                __builtin_prefetch(&leftSource[ind[pf]], 0, 2);
             auto output = interpolate<M>(&leftSource[*ind], *coeff);
             IF_CONSTEXPR(Adding) {
                 float g = *addingGain++;
@@ -1382,6 +1396,10 @@ void Voice::Impl::fillInterpolated(
         auto right = dest.getChannel(1);
         auto rightSource = source.getConstSpan(1);
         while (ind < indices.end()) {
+            if (pf && ind + pf < indices.end()) {
+                __builtin_prefetch(&leftSource[ind[pf]], 0, 2);
+                __builtin_prefetch(&rightSource[ind[pf]], 0, 2);
+            }
             auto leftOutput = interpolate<M>(&leftSource[*ind], *coeff);
             auto rightOutput = interpolate<M>(&rightSource[*ind], *coeff);
             IF_CONSTEXPR(Adding) {
