@@ -44,9 +44,11 @@ void sfizz_release_align_set_fallback(float seconds);
 
 namespace sfz {
 
-// Canonical lookup key = last two path components with '/' separators, so a relative SFZ
-// path ("Stop/037-C#.flac") and an absolute rewritten path (".../samples/Stop/037-C#.flac")
-// resolve to the same entry.
+// Canonical lookup key = the WHOLE sample path, normalized to '/' separators. The two load
+// modes each register and look up a consistent path form (legacy master = relative paths;
+// multi-organ palette = absolute per-organ paths written into both sample= and the tsv), so
+// exact matching works for both AND keeps keys organ-unique in a mixed palette (the absolute
+// path carries the organ directory; a bare "Stop/file.flac" would collide across organs).
 std::string releaseAlignKey(const std::string& path);
 
 bool releaseAlignEnabled() noexcept;

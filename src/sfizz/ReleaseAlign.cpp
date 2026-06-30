@@ -31,12 +31,15 @@ namespace sfz {
 
 std::string releaseAlignKey(const std::string& path)
 {
-    const auto npos = std::string::npos;
-    size_t e = path.find_last_of("/\\");
-    if (e == npos || e == 0)
-        return path;
-    size_t s = path.find_last_of("/\\", e - 1);
-    std::string out = (s == npos) ? path : path.substr(s + 1);
+    // Exact path match, normalized to '/' separators only. Both sides of the lookup
+    // already agree on the path form within a single load: the legacy master SFZ uses
+    // relative sample paths ("Subbas16/036-C.flac") and ships a tsv keyed the same way,
+    // while the multi-organ palette rewrites sample= to absolute per-organ paths
+    // (".../files/<organId>/samples/Subbas16/036-C.flac") and the app writes the tsv with
+    // those same absolute keys. Keeping the WHOLE path (not just the last two components)
+    // is what makes the key organ-unique: a relative "Principal8/036-C.flac" would collide
+    // across organs in a mixed palette, but the absolute path carries the organ directory.
+    std::string out = path;
     for (char& c : out)
         if (c == '\\')
             c = '/';
