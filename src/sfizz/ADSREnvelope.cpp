@@ -48,6 +48,7 @@ void ADSREnvelope::reset(const EGDescription& desc, const Region& region, int de
     updateValues(delay);
     releaseDelay = 0;
     shouldRelease = false;
+    linearRelease = false;
     freeRunning = (
         (this->sustain <= Float(config::sustainFreeRunningThreshold))
         || (region.loopMode == LoopMode::one_shot && region.isOscillator())
@@ -163,8 +164,13 @@ void ADSREnvelope::getBlockInternal(absl::Span<Float> output) noexcept
             break;
         case State::Release:
             previousValue = currentValue;
-            while (count < size && (currentValue *= releaseRate) > config::egReleaseThreshold)
-                output[count++] = previousValue = currentValue;
+            if (linearRelease) {
+                while (count < size && (currentValue -= releaseStep) > config::egReleaseThreshold)
+                    output[count++] = previousValue = currentValue;
+            } else {
+                while (count < size && (currentValue *= releaseRate) > config::egReleaseThreshold)
+                    output[count++] = previousValue = currentValue;
+            }
             if (currentValue <= config::egReleaseThreshold) {
                 currentState = State::Fadeout;
                 currentValue = previousValue;
@@ -219,6 +225,21 @@ void ADSREnvelope::cancelRelease(int delay) noexcept
 void ADSREnvelope::setReleaseTime(Float timeInSeconds) noexcept
 {
     releaseRate = secondsToExpRate(timeInSeconds);
+}
+
+void ADSREnvelope::setLinearReleaseTime(Float timeInSeconds) noexcept
+{
+    linearRelease = true;
+    // Ramp from the CURRENT value to 0 over timeInSeconds, so the fade takes the full
+    // crossfade window regardless of how far the attack had progressed (short notes
+    // release mid-onset at <1.0). Keeps it complementary to the release voice's fade-in.
+    const Float samples = std::max(Float(1), sampleRate * timeInSeconds);
+    releaseStep = std::max(currentValue, config::egReleaseThreshold) / samples;
+}
+
+void ADSREnvelope::setAttackTime(Float timeInSeconds) noexcept
+{
+    attackStep = secondsToLinRate(timeInSeconds);
 }
 
 }

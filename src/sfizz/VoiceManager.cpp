@@ -65,7 +65,7 @@ void VoiceManager::reset()
     setStealingAlgorithm(StealingAlgorithm::Oldest);
 }
 
-bool VoiceManager::playingAttackVoice(const Region* releaseRegion) noexcept
+Voice* VoiceManager::findAttackVoice(const Region* releaseRegion) noexcept
 {
     const auto compatibleVoice = [releaseRegion](const Voice& v) -> bool {
         const TriggerEvent& event = v.getTriggerEvent();
@@ -77,10 +77,13 @@ bool VoiceManager::playingAttackVoice(const Region* releaseRegion) noexcept
         );
     };
 
-    if (absl::c_find_if(list_, compatibleVoice) == list_.end())
-        return false;
-    else
-        return true;
+    auto it = absl::c_find_if(list_, compatibleVoice);
+    return it == list_.end() ? nullptr : &(*it);
+}
+
+bool VoiceManager::playingAttackVoice(const Region* releaseRegion) noexcept
+{
+    return findAttackVoice(releaseRegion) != nullptr;
 }
 
 void VoiceManager::ensureNumPolyphonyGroups(int groupIdx) noexcept

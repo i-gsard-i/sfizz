@@ -17,6 +17,7 @@
 #include "MathHelpers.h"
 #include "ModifierHelpers.h"
 #include "RegionStateful.h"
+#include "ReleaseAlign.h"
 #include "TriggerEvent.h"
 #include "modulations/ModId.h"
 #include "modulations/ModKey.h"
@@ -253,6 +254,8 @@ struct Voice::Impl
 
     float floatPositionOffset_ { 0.0f };
     int sourcePosition_ { 0 };
+    int releaseStartOverride_ { -1 };   // >=0: phase-aligned release start (ReleaseAlign.h)
+    float releaseGainScale_ { 1.0f };   // release tail scaled to note's level at release
     int initialDelay_ { 0 };
     int age_ { 0 };
     uint32_t count_ { 1 };
@@ -496,7 +499,16 @@ bool Voice::startVoice(Layer* layer, int delay, const TriggerEvent& event) noexc
         }
         impl.updateLoopInformation();
         impl.speedRatio_ = static_cast<float>(impl.currentPromise_->information.sampleRate / impl.sampleRate_);
-        impl.sourcePosition_ = sampleOffset(region, midiState);
+        // Phase-aligned release tails (ReleaseAlign.h): if Synth computed an aligned start
+        // frame for this release voice, use it (clamped inside the sample) instead of the
+        // region offset; otherwise fall back to the normal offset opcode.
+        if (impl.releaseStartOverride_ >= 0) {
+            const int maxStart = static_cast<int>(impl.currentPromise_->information.end) - 256;
+            impl.sourcePosition_ = max(0, min(impl.releaseStartOverride_, maxStart));
+        } else {
+            impl.sourcePosition_ = sampleOffset(region, midiState);
+        }
+        impl.releaseStartOverride_ = -1;
     }
 
     // do Scala retuning and reconvert the frequency into a 12TET key number
@@ -514,6 +526,10 @@ bool Voice::startVoice(Layer* layer, int delay, const TriggerEvent& event) noexc
     impl.baseGain_ = region.getBaseGain();
     if (impl.triggerEvent_.type != TriggerEventType::CC || region.velocityOverride == VelocityOverride::previous)
         impl.baseGain_ *= noteGain(region, impl.triggerEvent_.number, impl.triggerEvent_.value, midiState, curveSet);
+    // Release-tail crossfade (ReleaseAlign.h): scale this release voice to the note's level
+    // at release so a half-spoken note gets a half-level tail (no swell on slow-onset pipes).
+    impl.baseGain_ *= impl.releaseGainScale_;
+    impl.releaseGainScale_ = 1.0f;
 
     impl.gainSmoother_.reset();
     impl.resetCrossfades();
@@ -655,8 +671,27 @@ void Voice::registerNoteOff(int delay, int noteNumber, float velocity) noexcept
         const bool sostenutoPedalReleaseCondition = !impl.region_->checkSostenuto
             || impl.sostenutoState_ != Impl::SostenutoState::Sustaining;
 
-        if (sustainPedalReleaseCondition && sostenutoPedalReleaseCondition)
+        if (sustainPedalReleaseCondition && sostenutoPedalReleaseCondition) {
+            // Phase-aligned release tails (ReleaseAlign.h): when tails are on, the sustain
+            // voice must fade OUT LINEARLY over the crossfade window (matching the incoming
+            // aligned release's linear fade-in of the same duration) instead of the
+            // synthetic-fade exponential, so two in-phase copies sum to ~constant amplitude
+            // (no bump, no mid-crossfade dip). stopDynamicUpdates() keeps ampeg_releasecc
+            // from re-deriving the rate. Looped (sustain) voices only.
+            if (sfz::releaseAlignEnabled() && impl.region_->shouldLoop()) {
+                // Crossfade out only if THIS pipe has a recorded, aligned release tail to
+                // hand off to. The lowest C of each rank has no release sample; shortening
+                // it would cut the note ("dies with the release"), so give those a plain
+                // exponential fade ~the typical recorded-tail length instead.
+                float p_, lr_; int a_;
+                if (sfz::releaseAlignLookup(impl.region_->sampleId->filename(), p_, a_, lr_))
+                    impl.egAmplitude_.setLinearReleaseTime(sfz::releaseAlignCrossfade());
+                else
+                    impl.egAmplitude_.setReleaseTime(sfz::releaseAlignFallback());
+                impl.egAmplitude_.stopDynamicUpdates();
+            }
             release(delay);
+        }
     }
 }
 
@@ -1723,6 +1758,8 @@ void Voice::reset() noexcept
     impl.region_ = nullptr;
     impl.currentPromise_.reset();
     impl.sourcePosition_ = 0;
+    impl.releaseStartOverride_ = -1;
+    impl.releaseGainScale_ = 1.0f;
     impl.age_ = 0;
     impl.count_ = 1;
     impl.floatPositionOffset_ = 0.0f;
@@ -2102,6 +2139,32 @@ int Voice::getSourcePosition() const noexcept
 {
     Impl& impl = *impl_;
     return impl.sourcePosition_;
+}
+
+int Voice::getLoopStart() const noexcept
+{
+    Impl& impl = *impl_;
+    return impl.loop_.start;
+}
+
+float Voice::getCurrentPower() const noexcept
+{
+    return impl_->powerFollower_.getAveragePower();
+}
+
+float Voice::getBaseGain() const noexcept
+{
+    return impl_->baseGain_;
+}
+
+void Voice::setReleaseStartOverride(int sourceFrame) noexcept
+{
+    impl_->releaseStartOverride_ = sourceFrame;
+}
+
+void Voice::setReleaseGainScale(float scale) noexcept
+{
+    impl_->releaseGainScale_ = scale;
 }
 
 unsigned Voice::getStartTimestampSamples() const noexcept

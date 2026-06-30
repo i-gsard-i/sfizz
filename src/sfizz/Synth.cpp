@@ -16,6 +16,7 @@
 #include "pugixml.hpp"
 #include "Region.h"
 #include "RegionSet.h"
+#include "ReleaseAlign.h"
 #include "Resources.h"
 #include "BufferPool.h"
 #include "FilePool.h"
@@ -30,6 +31,7 @@
 #include "utility/Timing.h"
 #include "utility/XmlHelpers.h"
 #include "Voice.h"
+#include "ADSREnvelope.h"
 #include "Interpolators.h"
 #include "parser/Parser.h"
 #include <absl/algorithm/container.h>
@@ -40,6 +42,7 @@
 #include <absl/types/span.h>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <random>
 #include <utility>
@@ -1307,8 +1310,54 @@ void Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& trigge
         return;
 
     selectedVoice->reset();
-    if (selectedVoice->startVoice(layer, delay, triggerEvent))
+
+    // Phase-aligned release tails (ReleaseAlign.h): when this is a release voice and the
+    // master enable is on, start the release sample in phase with the sustain loop it is
+    // replacing. `region` here is the RELEASE region; the alignment data is keyed by the
+    // ATTACK sample (the one whose live loop position we can read), so look it up via the
+    // attack voice currently sounding this note.
+    bool releaseAligned = false;
+    if (sfz::releaseAlignEnabled() && region.isRelease()) {
+        if (Voice* attack = voiceManager_.findAttackVoice(&region)) {
+            float period = 0.0f; int anchor = 0; float loopRms = 0.0f;
+            if (sfz::releaseAlignLookup(attack->getRegion()->sampleId->filename(), period, anchor, loopRms)) {
+                const int loopPeriod = static_cast<int>(std::lround(period));
+                float phi = std::fmod(static_cast<float>(attack->getSourcePosition() - attack->getLoopStart()), period);
+                if (phi < 0.0f)
+                    phi += period;
+                int start = static_cast<int>(std::lround(anchor + phi));
+                const int guard = 64;   // leave a few frames of crossfade headroom
+                while (start < guard && loopPeriod > 0)
+                    start += loopPeriod;
+                selectedVoice->setReleaseStartOverride(start);
+                // Scale the tail to the note's ACTUAL current level (GrandOrgue does this):
+                // a short note on a slow-onset pipe is still quiet -- but that quietness is
+                // in the SAMPLE, not the 1 ms amplitude EG -- so a full-level tail swells
+                // ("ta-da"). Use the live output power vs the pipe's full (loop) level:
+                //   f = currentRMS / (baseGain * loopRms)   (both in (L+R) output units).
+                if (loopRms > 1e-6f) {
+                    const float full = attack->getBaseGain() * loopRms;
+                    float f = (full > 1e-9f) ? std::sqrt(attack->getCurrentPower()) / full : 1.0f;
+                    f = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+                    selectedVoice->setReleaseGainScale(f);
+                }
+                releaseAligned = true;
+            }
+        }
+    }
+
+    if (selectedVoice->startVoice(layer, delay, triggerEvent)) {
+        // Stretch the aligned release voice's linear fade-in to the crossfade window so it
+        // is complementary to the sustain's linear fade-out (ReleaseAlign.h). Done after
+        // startVoice (which resets the EG); stopDynamicUpdates() pins it past ampeg_attack.
+        if (releaseAligned) {
+            if (ADSREnvelope* eg = selectedVoice->getAmplitudeEG()) {
+                eg->setAttackTime(sfz::releaseAlignCrossfade());
+                eg->stopDynamicUpdates();
+            }
+        }
         ring.addVoiceToRing(selectedVoice);
+    }
 }
 
 void Synth::Impl::checkOffGroups(const Region* region, int delay, int number, bool chokedByCC)

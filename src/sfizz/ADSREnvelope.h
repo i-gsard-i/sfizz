@@ -45,6 +45,19 @@ public:
      */
     void setReleaseTime(Float timeInSeconds) noexcept;
     /**
+     * @brief Use a LINEAR release ramp (value -> 0 over the given time) instead of the
+     * default exponential one. Used by the phase-aligned release-tail crossfade
+     * (ReleaseAlign.h): a linear fade-out, paired with the release voice's linear fade-in
+     * of the same duration, sums to constant amplitude for two in-phase copies (no bump,
+     * no mid-crossfade dip). Pair with stopDynamicUpdates() so it is not re-derived.
+     */
+    void setLinearReleaseTime(Float timeInSeconds) noexcept;
+    /**
+     * @brief Override the (linear) attack ramp duration. Used to stretch the release
+     * voice's fade-in to match the sustain's crossfade-out. Pair with stopDynamicUpdates().
+     */
+    void setAttackTime(Float timeInSeconds) noexcept;
+    /**
      * @brief Start the envelope release after a delay.
      *
      * @param releaseDelay the delay before releasing in samples
@@ -112,6 +125,8 @@ private:
     Float attackStep { 0 };
     Float decayRate { 0 };
     Float releaseRate { 0 };
+    Float releaseStep { 0 };          // per-sample decrement when linearRelease is set
+    bool linearRelease { false };     // linear (vs exponential) release ramp
     int hold { 0 };
     Float start { 0 };
     Float sustain { 0 };

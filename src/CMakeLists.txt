@@ -138,6 +138,7 @@ set(SFIZZ_SOURCES
     sfizz/RegionStateful.cpp
     sfizz/Region.cpp
     sfizz/Voice.cpp
+    sfizz/ReleaseAlign.cpp
     sfizz/ScopedFTZ.cpp
     sfizz/MidiState.cpp
     sfizz/Oversampler.cpp

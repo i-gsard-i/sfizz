@@ -438,6 +438,35 @@ public:
     int getSourcePosition() const noexcept;
 
     /**
+     * @brief Get the loop start position in the source sample (0 if not looped)
+     *
+     * @return int
+     */
+    int getLoopStart() const noexcept;
+
+    /**
+     * @brief Current smoothed output power (PowerFollower) and base gain, used by the
+     * release-tail crossfade to scale the tail to the note's actual current level (which,
+     * for slow-onset pipes, lives in the sample data, not the 1 ms amplitude EG).
+     */
+    float getCurrentPower() const noexcept;
+    float getBaseGain() const noexcept;
+
+    /**
+     * @brief Force the next startVoice() to begin the sample at this source frame instead
+     * of the region's offset opcode. Used by the phase-aligned release-tail path
+     * (ReleaseAlign.h) to start a release sample in phase with the loop it replaces.
+     * Negative (the default, cleared every reset()) means "use the region offset".
+     */
+    void setReleaseStartOverride(int sourceFrame) noexcept;
+
+    /**
+     * @brief Scale this (release) voice's gain, used by the release-tail crossfade to match
+     * the tail level to the note's amplitude at release. Cleared every reset().
+     */
+    void setReleaseGainScale(float scale) noexcept;
+
+    /**
      * @brief Get the timestamp in midistate transport sample time when the voice was started, in samples
      *
      * @return int
