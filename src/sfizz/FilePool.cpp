@@ -355,6 +355,101 @@ bool sfz::FilePool::preloadFile(const FileId& fileId, uint32_t maxOffset) noexce
     return true;
 }
 
+// ---- Batch preload with parallel decode (organdroid patch) ----
+// Cold-loading a large SFZ preloads the head of a few thousand FLAC files; doing that
+// sequentially (one preloadFile per region file) leaves every core but one idle and
+// dominates load time. preloadFiles() decodes fresh files on a short-lived local pool,
+// then publishes the results into preloadedFiles sequentially, so no shared FilePool
+// state is ever touched from a worker. The done/total atomics feed the host app's
+// loading bar; they are process-global (one synth loads at a time in the organ app).
+
+static std::atomic<int> preloadProgressDone { 0 };
+static std::atomic<int> preloadProgressTotal { 0 };
+
+extern "C" void sfizz_preload_progress(int* done, int* total)
+{
+    if (done)  *done  = preloadProgressDone.load(std::memory_order_relaxed);
+    if (total) *total = preloadProgressTotal.load(std::memory_order_relaxed);
+}
+
+extern "C" void sfizz_preload_progress_reset()
+{
+    preloadProgressDone.store(0, std::memory_order_relaxed);
+    preloadProgressTotal.store(0, std::memory_order_relaxed);
+}
+
+void sfz::FilePool::preloadFiles(const std::vector<std::pair<FileId, uint32_t>>& files) noexcept
+{
+    preloadProgressDone.store(0, std::memory_order_relaxed);
+    preloadProgressTotal.store(static_cast<int>(files.size()), std::memory_order_relaxed);
+
+    // Files already tracked keep preloadFile()'s exact sequential bookkeeping; only
+    // files in neither map (the whole set on a cold load) are farmed out to workers.
+    struct PreloadJob {
+        const FileId* id;
+        uint32_t maxOffset;
+        absl::optional<FileInformation> information;
+        FileAudioBuffer data;
+        bool fullyLoaded { false };
+        bool ok { false };
+    };
+    std::vector<PreloadJob> jobs;
+    jobs.reserve(files.size());
+    for (const auto& item : files) {
+        if (loadedFiles.contains(item.first) || preloadedFiles.contains(item.first)) {
+            preloadFile(item.first, item.second);
+            preloadProgressDone.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            jobs.push_back(PreloadJob { &item.first, item.second, {}, {}, false, false });
+        }
+    }
+
+    if (!jobs.empty()) {
+        // A dedicated pool, NOT the shared streaming pool: a still-audible synth (the old
+        // palette during a hot-swap) streams through that pool, and its jobs must not
+        // queue behind thousands of decode jobs.
+        unsigned numThreads = std::thread::hardware_concurrency();
+        numThreads = (numThreads > 2) ? (numThreads - 2) : 1;
+        ThreadPool pool { numThreads };
+        std::vector<std::future<void>> futures;
+        futures.reserve(jobs.size());
+        for (PreloadJob& job : jobs) {
+            futures.push_back(pool.enqueue([this, &job] {
+                const fs::path file { rootDirectory / job.id->filename() };
+                std::error_code ec;
+                if (fs::exists(file, ec)) {
+                    AudioReaderPtr reader = createAudioReader(file, job.id->isReverse());
+                    auto information = getReaderInformation(reader.get());
+                    if (information) {
+                        information->maxOffset = job.maxOffset;
+                        information->sampleRate = static_cast<double>(reader->sampleRate());
+                        const auto frames = static_cast<uint32_t>(reader->frames());
+                        const auto framesToLoad = loadInRam
+                            ? frames : min(frames, job.maxOffset + preloadSize);
+                        job.data = readFromFile(*reader, framesToLoad);
+                        job.fullyLoaded = framesToLoad == frames;
+                        job.information = information;
+                        job.ok = true;
+                    }
+                }
+                preloadProgressDone.fetch_add(1, std::memory_order_relaxed);
+            }));
+        }
+        for (auto& f : futures)
+            f.wait();
+    }
+
+    for (PreloadJob& job : jobs) {
+        if (!job.ok)
+            continue;
+        auto insertedPair = preloadedFiles.insert_or_assign(*job.id,
+            FileData(std::move(job.data), *job.information));
+        insertedPair.first->second.preloadCallCount++;
+        insertedPair.first->second.status = FileData::Status::Preloaded;
+        insertedPair.first->second.fullyLoaded = job.fullyLoaded;
+    }
+}
+
 void sfz::FilePool::resetPreloadCallCounts() noexcept
 {
     for (auto& preloadedFile: preloadedFiles)

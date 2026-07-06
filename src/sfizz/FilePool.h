@@ -232,6 +232,17 @@ public:
     bool preloadFile(const FileId& fileId, uint32_t maxOffset) noexcept;
 
     /**
+     * @brief Preload a batch of files, decoding fresh files in parallel on a
+     * short-lived worker pool (organdroid patch). Equivalent to calling
+     * preloadFile() for every entry, but a cold load uses all cores instead of
+     * one. Also publishes done/total counters for the host's loading bar
+     * (see sfizz_preload_progress()).
+     *
+     * @param files (fileId, maxOffset) pairs, unique by fileId
+     */
+    void preloadFiles(const std::vector<std::pair<FileId, uint32_t>>& files) noexcept;
+
+    /**
      * @brief Load a file and return its information. The file pool will store this
      * data for future requests so use this function responsibly.
      *

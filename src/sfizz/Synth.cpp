@@ -896,8 +896,15 @@ void Synth::Impl::finalizeSfzLoad()
     if (reloading)
         filePool.resetPreloadCallCounts();
 
-    for (const auto& toLoad: filesToLoad)
-        filePool.preloadFile(toLoad.first, toLoad.second);
+    {
+        // Batch + parallel-decode the preloads (organdroid patch): same semantics as
+        // per-file preloadFile(), but a cold load uses every core and reports progress.
+        std::vector<std::pair<FileId, uint32_t>> preloadList;
+        preloadList.reserve(filesToLoad.size());
+        for (const auto& toLoad: filesToLoad)
+            preloadList.emplace_back(toLoad.first, static_cast<uint32_t>(toLoad.second));
+        filePool.preloadFiles(preloadList);
+    }
 
     // Remove preloaded data with no linked regions
     if (reloading)
