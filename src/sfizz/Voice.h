@@ -476,6 +476,14 @@ public:
     uint32_t getDivisionMask() const noexcept;
 
     /**
+     * @brief Gate CC of the stop whose region started this voice (Jukkasjarvi live
+     * registration, DivisionGate.h): a stop-filtered retro note-off releases only
+     * that stop's voices. -1 (the default, restored every reset()) = untagged.
+     */
+    void setGateCc(int cc) noexcept;
+    int getGateCc() const noexcept;
+
+    /**
      * @brief Get the timestamp in midistate transport sample time when the voice was started, in samples
      *
      * @return int

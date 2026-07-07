@@ -274,6 +274,9 @@ struct Region {
     // Console-division bitmask (Jukkasjarvi manual assignment, DivisionGate.h): custom
     // `division=N` opcode sets bit N; regions without it belong to every division.
     uint32_t divMask { 0xFFFFFFFFu }; // division
+    // Owning stop's gate CC (Jukkasjarvi live registration, DivisionGate.h): custom
+    // `stop_cc=N` opcode; -1 = untagged. Filtered note events act only on their stop.
+    int gateCc { -1 }; // stop_cc
 
     // Region logic: key mapping
     UncheckedRange<uint8_t> keyRange { Default::loKey, Default::hiKey }; //lokey, hikey and key

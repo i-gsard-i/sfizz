@@ -191,6 +191,12 @@ bool sfz::Region::parseOpcode(const Opcode& rawOpcode, bool cleanOpcode)
             divMask = 1u << divisionIndex;
         break;
     }
+    case hash("stop_cc"): { // Jukkasjarvi live registration (DivisionGate.h)
+        int cc {};
+        if (absl::SimpleAtoi(opcode.value, &cc) && cc >= 0 && cc < 128)
+            gateCc = cc;
+        break;
+    }
     case hash("output"):
         output = opcode.read(Default::output);
         break;

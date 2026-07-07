@@ -1278,9 +1278,12 @@ void Synth::hdNoteOn(int delay, int noteNumber, float normalizedVelocity) noexce
 
     // Route this note to its console division(s) (DivisionGate.h): regions outside the
     // event's mask don't trigger. Unset (the default) = all-bits = stock behavior.
+    // The stop filter (live registration) further narrows a retro attack to ONE stop.
     impl.dispatchDivMask_ = divisionConsumeMask();
+    impl.dispatchStopCc_ = stopConsumeFilter();
     impl.noteOnDispatch(delay, noteNumber, normalizedVelocity);
     impl.dispatchDivMask_ = kDivisionAll;
+    impl.dispatchStopCc_ = kStopFilterNone;
 }
 
 void Synth::noteOff(int delay, int noteNumber, int velocity) noexcept
@@ -1307,15 +1310,19 @@ void Synth::hdNoteOff(int delay, int noteNumber, float normalizedVelocity) noexc
     const auto replacedVelocity = midiState.getNoteVelocity(noteNumber);
 
     // Division-gated release (DivisionGate.h): only voices started by this division's
-    // note-on respond, so the same key held on another manual keeps sounding.
+    // note-on respond, so the same key held on another manual keeps sounding. The stop
+    // filter (live registration) further narrows a retro release to ONE stop's voices.
     impl.dispatchDivMask_ = divisionConsumeMask();
+    impl.dispatchStopCc_ = stopConsumeFilter();
 
     for (auto& voice : impl.voiceManager_)
-        if ((voice.getDivisionMask() & impl.dispatchDivMask_) != 0)
+        if ((voice.getDivisionMask() & impl.dispatchDivMask_) != 0
+            && (impl.dispatchStopCc_ < 0 || voice.getGateCc() == impl.dispatchStopCc_))
             voice.registerNoteOff(delay, noteNumber, replacedVelocity);
 
     impl.noteOffDispatch(delay, noteNumber, replacedVelocity);
     impl.dispatchDivMask_ = kDivisionAll;
+    impl.dispatchStopCc_ = kStopFilterNone;
 }
 
 void Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& triggerEvent, SisterVoiceRingBuilder& ring) noexcept
@@ -1365,9 +1372,15 @@ void Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& trigge
     }
 
     if (selectedVoice->startVoice(layer, delay, triggerEvent)) {
-        // Record the dispatching note event's division on the voice (DivisionGate.h) so
-        // a later note-off releases only its own manual's voices. startVoice() reset it.
-        selectedVoice->setDivisionMask(dispatchDivMask_);
+        // Record the divisions this voice actually SOUNDS for (DivisionGate.h): the note
+        // event's mask intersected with the region's own division. A coupled note-on
+        // (mask = dest|src) starts each stop's voice with only that stop's division bit,
+        // so a later coupler retro-release of src leaves dest's voices sounding. Untagged
+        // regions (all-bits) keep the event mask = stock behavior. startVoice() reset it.
+        selectedVoice->setDivisionMask(dispatchDivMask_ & region.divMask);
+        // And its stop's gate CC, so a stop-filtered retro note-off releases only that
+        // stop's voices (live registration).
+        selectedVoice->setGateCc(region.gateCc);
         // Stretch the aligned release voice's linear fade-in to the crossfade window so it
         // is complementary to the sustain's linear fade-out (ReleaseAlign.h). Done after
         // startVoice (which resets the EG); stopDynamicUpdates() pins it past ampeg_attack.
@@ -1408,6 +1421,8 @@ void Synth::Impl::noteOffDispatch(int delay, int noteNumber, float velocity) noe
         const Region& region = layer->getRegion();
         if ((region.divMask & dispatchDivMask_) == 0)   // DivisionGate.h
             continue;
+        if (dispatchStopCc_ >= 0 && region.gateCc != dispatchStopCc_)   // live registration
+            continue;
         if (layer->registerNoteOff(noteNumber, velocity, randValue)) {
             if (region.trigger == Trigger::release && !region.rtDead && !voiceManager_.playingAttackVoice(&region))
                 continue;
@@ -1443,6 +1458,8 @@ void Synth::Impl::noteOnDispatch(int delay, int noteNumber, float velocity) noex
 
     for (Layer* layer : noteActivationLists_[noteNumber]) {
         if ((layer->getRegion().divMask & dispatchDivMask_) == 0)   // DivisionGate.h
+            continue;
+        if (dispatchStopCc_ >= 0 && layer->getRegion().gateCc != dispatchStopCc_)   // live registration
             continue;
         if (layer->registerNoteOn(noteNumber, velocity, randValue)) {
             const Region& region = layer->getRegion();

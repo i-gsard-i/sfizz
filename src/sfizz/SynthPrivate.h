@@ -368,6 +368,10 @@ struct Synth::Impl final: public Parser::Listener {
     // assignment, DivisionGate.h). Set from the consumed next-event mask in hdNoteOn/
     // hdNoteOff, restored to all-bits after; every other dispatch path sees all-bits.
     uint32_t dispatchDivMask_ { 0xFFFFFFFFu };
+    // Stop gate-CC filter of the note event currently being dispatched (Jukkasjarvi
+    // live registration, DivisionGate.h). >= 0: the event acts only on regions/voices
+    // whose stop_cc matches. Same consume/restore discipline as the division mask.
+    int dispatchStopCc_ { -1 };
 
     std::chrono::time_point<std::chrono::high_resolution_clock> lastGarbageCollection_;
 
