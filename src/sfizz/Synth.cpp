@@ -17,6 +17,7 @@
 #include "Region.h"
 #include "RegionSet.h"
 #include "ReleaseAlign.h"
+#include "DivisionGate.h"
 #include "Resources.h"
 #include "BufferPool.h"
 #include "FilePool.h"
@@ -1275,7 +1276,11 @@ void Synth::hdNoteOn(int delay, int noteNumber, float normalizedVelocity) noexce
     if (impl.lastKeyswitchLists_[noteNumber].empty())
         impl.resources_.getMidiState().noteOnEvent(delay, noteNumber, normalizedVelocity);
 
+    // Route this note to its console division(s) (DivisionGate.h): regions outside the
+    // event's mask don't trigger. Unset (the default) = all-bits = stock behavior.
+    impl.dispatchDivMask_ = divisionConsumeMask();
     impl.noteOnDispatch(delay, noteNumber, normalizedVelocity);
+    impl.dispatchDivMask_ = kDivisionAll;
 }
 
 void Synth::noteOff(int delay, int noteNumber, int velocity) noexcept
@@ -1301,10 +1306,16 @@ void Synth::hdNoteOff(int delay, int noteNumber, float normalizedVelocity) noexc
 
     const auto replacedVelocity = midiState.getNoteVelocity(noteNumber);
 
+    // Division-gated release (DivisionGate.h): only voices started by this division's
+    // note-on respond, so the same key held on another manual keeps sounding.
+    impl.dispatchDivMask_ = divisionConsumeMask();
+
     for (auto& voice : impl.voiceManager_)
-        voice.registerNoteOff(delay, noteNumber, replacedVelocity);
+        if ((voice.getDivisionMask() & impl.dispatchDivMask_) != 0)
+            voice.registerNoteOff(delay, noteNumber, replacedVelocity);
 
     impl.noteOffDispatch(delay, noteNumber, replacedVelocity);
+    impl.dispatchDivMask_ = kDivisionAll;
 }
 
 void Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& triggerEvent, SisterVoiceRingBuilder& ring) noexcept
@@ -1354,6 +1365,9 @@ void Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& trigge
     }
 
     if (selectedVoice->startVoice(layer, delay, triggerEvent)) {
+        // Record the dispatching note event's division on the voice (DivisionGate.h) so
+        // a later note-off releases only its own manual's voices. startVoice() reset it.
+        selectedVoice->setDivisionMask(dispatchDivMask_);
         // Stretch the aligned release voice's linear fade-in to the crossfade window so it
         // is complementary to the sustain's linear fade-out (ReleaseAlign.h). Done after
         // startVoice (which resets the EG); stopDynamicUpdates() pins it past ampeg_attack.
@@ -1392,6 +1406,8 @@ void Synth::Impl::noteOffDispatch(int delay, int noteNumber, float velocity) noe
 
     for (Layer* layer : noteActivationLists_[noteNumber]) {
         const Region& region = layer->getRegion();
+        if ((region.divMask & dispatchDivMask_) == 0)   // DivisionGate.h
+            continue;
         if (layer->registerNoteOff(noteNumber, velocity, randValue)) {
             if (region.trigger == Trigger::release && !region.rtDead && !voiceManager_.playingAttackVoice(&region))
                 continue;
@@ -1426,6 +1442,8 @@ void Synth::Impl::noteOnDispatch(int delay, int noteNumber, float velocity) noex
         layer->keySwitched_ = true;
 
     for (Layer* layer : noteActivationLists_[noteNumber]) {
+        if ((layer->getRegion().divMask & dispatchDivMask_) == 0)   // DivisionGate.h
+            continue;
         if (layer->registerNoteOn(noteNumber, velocity, randValue)) {
             const Region& region = layer->getRegion();
             if (region.useTimerRange && !voiceManager_.withinValidTimerRange(&region, midiState.getInternalClock() + delay, sampleRate_))

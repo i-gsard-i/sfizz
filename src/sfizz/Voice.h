@@ -467,6 +467,15 @@ public:
     void setReleaseGainScale(float scale) noexcept;
 
     /**
+     * @brief Division mask of the note event that started this voice (Jukkasjarvi
+     * manual assignment, DivisionGate.h): a note-off only releases voices whose mask
+     * intersects the event's, so the same key held on two manuals releases
+     * independently. All-bits (the default, restored every reset()) = stock behavior.
+     */
+    void setDivisionMask(uint32_t mask) noexcept;
+    uint32_t getDivisionMask() const noexcept;
+
+    /**
      * @brief Get the timestamp in midistate transport sample time when the voice was started, in samples
      *
      * @return int

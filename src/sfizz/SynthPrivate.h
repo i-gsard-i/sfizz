@@ -364,6 +364,11 @@ struct Synth::Impl final: public Parser::Listener {
     CallbackBreakdown callbackBreakdown_;
     double dispatchDuration_ { 0 };
 
+    // Division mask of the note event currently being dispatched (Jukkasjarvi manual
+    // assignment, DivisionGate.h). Set from the consumed next-event mask in hdNoteOn/
+    // hdNoteOff, restored to all-bits after; every other dispatch path sees all-bits.
+    uint32_t dispatchDivMask_ { 0xFFFFFFFFu };
+
     std::chrono::time_point<std::chrono::high_resolution_clock> lastGarbageCollection_;
 
     Parser parser_;

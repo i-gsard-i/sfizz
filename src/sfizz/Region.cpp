@@ -14,6 +14,7 @@
 #include "utility/Debug.h"
 #include "modulations/ModId.h"
 #include "absl/strings/str_replace.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/match.h"
 #include "absl/algorithm/container.h"
@@ -183,6 +184,13 @@ bool sfz::Region::parseOpcode(const Opcode& rawOpcode, bool cleanOpcode)
     case hash("group"): // also polyphony_group
         group = opcode.read(Default::group);
         break;
+    case hash("division"): { // Jukkasjarvi manual assignment (DivisionGate.h)
+        int divisionIndex {};
+        if (absl::SimpleAtoi(opcode.value, &divisionIndex)
+            && divisionIndex >= 0 && divisionIndex < 32)
+            divMask = 1u << divisionIndex;
+        break;
+    }
     case hash("output"):
         output = opcode.read(Default::output);
         break;

@@ -271,6 +271,9 @@ struct Region {
     uint32_t polyphony { config::maxVoices }; // polyphony
     SelfMask selfMask { Default::selfMask };
     bool rtDead { Default::rtDead };
+    // Console-division bitmask (Jukkasjarvi manual assignment, DivisionGate.h): custom
+    // `division=N` opcode sets bit N; regions without it belong to every division.
+    uint32_t divMask { 0xFFFFFFFFu }; // division
 
     // Region logic: key mapping
     UncheckedRange<uint8_t> keyRange { Default::loKey, Default::hiKey }; //lokey, hikey and key

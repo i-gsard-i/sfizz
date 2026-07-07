@@ -256,6 +256,7 @@ struct Voice::Impl
     int sourcePosition_ { 0 };
     int releaseStartOverride_ { -1 };   // >=0: phase-aligned release start (ReleaseAlign.h)
     float releaseGainScale_ { 1.0f };   // release tail scaled to note's level at release
+    uint32_t divMask_ { 0xFFFFFFFFu };  // division of the starting note event (DivisionGate.h)
     int initialDelay_ { 0 };
     int age_ { 0 };
     uint32_t count_ { 1 };
@@ -1760,6 +1761,7 @@ void Voice::reset() noexcept
     impl.sourcePosition_ = 0;
     impl.releaseStartOverride_ = -1;
     impl.releaseGainScale_ = 1.0f;
+    impl.divMask_ = 0xFFFFFFFFu;
     impl.age_ = 0;
     impl.count_ = 1;
     impl.floatPositionOffset_ = 0.0f;
@@ -2165,6 +2167,16 @@ void Voice::setReleaseStartOverride(int sourceFrame) noexcept
 void Voice::setReleaseGainScale(float scale) noexcept
 {
     impl_->releaseGainScale_ = scale;
+}
+
+void Voice::setDivisionMask(uint32_t mask) noexcept
+{
+    impl_->divMask_ = mask;
+}
+
+uint32_t Voice::getDivisionMask() const noexcept
+{
+    return impl_->divMask_;
 }
 
 unsigned Voice::getStartTimestampSamples() const noexcept
