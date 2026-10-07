@@ -20,12 +20,21 @@
 // mutated while audio runs, so lock-free reads are safe; the enable flag is atomic.
 
 #pragma once
+#include <cstddef>
+#include <cstdint>
 #include <string>
 
 extern "C" {
 // Register/replace one attack-sample alignment entry. period & anchor are in source frames;
 // loopRms is the (L+R) RMS of the loop body (the pipe's full level reference for tail scaling).
 void sfizz_release_align_set(const char* attackSample, float period, int anchor, float loopRms);
+// Attach a phase track to an entry already set (docs/design/RELEASE_PHASE_TRACK_DESIGN.md).
+// `column` is the tsv's sixth column as written by tools/phase_track.py: "v1:" + base64 of
+// one byte per point, point i at source frame i*4*round(period), the byte being the
+// correction to the anchor's start in 1/256 of a period. The anchor holds only near
+// loop_start: a pipe recorded in a church drifts, so elsewhere the tail would start at a
+// near-random phase. Returns the number of points, 0 if the column is not understood.
+int sfizz_release_align_set_track(const char* attackSample, const char* column);
 // Drop all entries (call before re-registering on a fresh organ load).
 void sfizz_release_align_clear();
 // Master enable, driven by the app's "Release tails" toggle. Default OFF -> byte-identical
@@ -59,7 +68,13 @@ float releaseAlignCrossfade() noexcept;
 // Fallback fade time in seconds for no-tail pipes (see setter above).
 float releaseAlignFallback() noexcept;
 
-// On hit, fills period/anchor (source frames) + loopRms and returns true.
-bool releaseAlignLookup(const std::string& attackSample, float& period, int& anchor, float& loopRms);
+// On hit, fills period/anchor (source frames) + loopRms and returns true. track/trackSize
+// get the entry's phase track (nullptr/0 if it has none); valid until the next clear.
+bool releaseAlignLookup(const std::string& attackSample, float& period, int& anchor, float& loopRms,
+                        const uint8_t*& track, size_t& trackSize);
+
+// Correction (source frames) the phase track adds at source position `pos`: the nearest
+// point's byte * period / 256. 0 without a track.
+float releaseAlignTrackCorrection(const uint8_t* track, size_t trackSize, float period, int64_t pos) noexcept;
 
 } // namespace sfz

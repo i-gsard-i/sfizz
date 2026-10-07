@@ -4,11 +4,14 @@
 
 #include "ReleaseAlign.h"
 #include <atomic>
+#include <cmath>
+#include <cstring>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
-struct Entry { float period; int anchor; float loopRms; };
+struct Entry { float period; int anchor; float loopRms; std::vector<uint8_t> track; };
 
 struct Registry {
     std::unordered_map<std::string, Entry> map;
@@ -61,7 +64,8 @@ float releaseAlignFallback() noexcept
     return reg().fallback.load(std::memory_order_relaxed);
 }
 
-bool releaseAlignLookup(const std::string& attackSample, float& period, int& anchor, float& loopRms)
+bool releaseAlignLookup(const std::string& attackSample, float& period, int& anchor, float& loopRms,
+                        const uint8_t*& track, size_t& trackSize)
 {
     const auto& m = reg().map;
     auto it = m.find(releaseAlignKey(attackSample));
@@ -70,7 +74,22 @@ bool releaseAlignLookup(const std::string& attackSample, float& period, int& anc
     period = it->second.period;
     anchor = it->second.anchor;
     loopRms = it->second.loopRms;
+    track = it->second.track.empty() ? nullptr : it->second.track.data();
+    trackSize = it->second.track.size();
     return true;
+}
+
+float releaseAlignTrackCorrection(const uint8_t* track, size_t trackSize, float period, int64_t pos) noexcept
+{
+    if (!track || trackSize == 0 || period <= 0.0f)
+        return 0.0f;
+    const int64_t spacing = 4 * static_cast<int64_t>(std::lround(period));
+    if (spacing <= 0)
+        return 0.0f;
+    int64_t i = pos > 0 ? (pos + spacing / 2) / spacing : 0;    // nearest point
+    if (i >= static_cast<int64_t>(trackSize))
+        i = static_cast<int64_t>(trackSize) - 1;
+    return track[i] * period / 256.0f;
 }
 
 } // namespace sfz
@@ -81,7 +100,37 @@ void sfizz_release_align_set(const char* attackSample, float period, int anchor,
 {
     if (!attackSample || period <= 0.0f)
         return;
-    reg().map[sfz::releaseAlignKey(attackSample)] = Entry { period, anchor, loopRms };
+    reg().map[sfz::releaseAlignKey(attackSample)] = Entry { period, anchor, loopRms, {} };
+}
+
+int sfizz_release_align_set_track(const char* attackSample, const char* column)
+{
+    if (!attackSample || !column || std::strncmp(column, "v1:", 3) != 0)
+        return 0;
+    auto it = reg().map.find(sfz::releaseAlignKey(attackSample));
+    if (it == reg().map.end())
+        return 0;
+    // base64, stopping at the first character outside the alphabet ('=', tab, CR, end).
+    std::vector<uint8_t> out;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (const char* c = column + 3; *c; ++c) {
+        int v;
+        if (*c >= 'A' && *c <= 'Z') v = *c - 'A';
+        else if (*c >= 'a' && *c <= 'z') v = *c - 'a' + 26;
+        else if (*c >= '0' && *c <= '9') v = *c - '0' + 52;
+        else if (*c == '+') v = 62;
+        else if (*c == '/') v = 63;
+        else break;
+        acc = (acc << 6) | static_cast<uint32_t>(v);
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<uint8_t>((acc >> bits) & 0xFF));
+        }
+    }
+    it->second.track = std::move(out);
+    return static_cast<int>(it->second.track.size());
 }
 
 void sfizz_release_align_clear()

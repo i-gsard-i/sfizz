@@ -685,8 +685,8 @@ void Voice::registerNoteOff(int delay, int noteNumber, float velocity) noexcept
                 // hand off to. The lowest C of each rank has no release sample; shortening
                 // it would cut the note ("dies with the release"), so give those a plain
                 // exponential fade ~the typical recorded-tail length instead.
-                float p_, lr_; int a_;
-                if (sfz::releaseAlignLookup(impl.region_->sampleId->filename(), p_, a_, lr_))
+                float p_, lr_; int a_; const uint8_t* t_; size_t n_;
+                if (sfz::releaseAlignLookup(impl.region_->sampleId->filename(), p_, a_, lr_, t_, n_))
                     impl.egAmplitude_.setLinearReleaseTime(sfz::releaseAlignCrossfade());
                 else
                     impl.egAmplitude_.setReleaseTime(sfz::releaseAlignFallback());

@@ -1345,11 +1345,17 @@ void Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& trigge
     if (sfz::releaseAlignEnabled() && region.isRelease()) {
         if (Voice* attack = voiceManager_.findAttackVoice(&region)) {
             float period = 0.0f; int anchor = 0; float loopRms = 0.0f;
-            if (sfz::releaseAlignLookup(attack->getRegion()->sampleId->filename(), period, anchor, loopRms)) {
+            const uint8_t* track = nullptr; size_t trackSize = 0;
+            if (sfz::releaseAlignLookup(attack->getRegion()->sampleId->filename(), period, anchor, loopRms,
+                                        track, trackSize)) {
                 const int loopPeriod = static_cast<int>(std::lround(period));
-                float phi = std::fmod(static_cast<float>(attack->getSourcePosition() - attack->getLoopStart()), period);
+                const int position = attack->getSourcePosition();
+                float phi = std::fmod(static_cast<float>(position - attack->getLoopStart()), period);
                 if (phi < 0.0f)
                     phi += period;
+                // The anchor is measured at loop_start; the phase track corrects it at the
+                // attack's actual position, where the recording has drifted (RELEASE_PHASE_TRACK_DESIGN.md).
+                phi += sfz::releaseAlignTrackCorrection(track, trackSize, period, position);
                 int start = static_cast<int>(std::lround(anchor + phi));
                 const int guard = 64;   // leave a few frames of crossfade headroom
                 while (start < guard && loopPeriod > 0)
