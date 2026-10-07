@@ -537,11 +537,21 @@ sfz::FileDataHolder sfz::FilePool::getFilePromise(const std::shared_ptr<FileId>&
     }
 
     auto& fileData = preloaded->second;
-    if (!fileData.fullyLoaded) {
+    // organdroid: queue the stream only when nobody has yet. An organ chord strikes the
+    // same files over and over (every stop x every key, then their release tails), and a
+    // job for a file already Streaming/Done returns at once (loadingJob), so those pushes
+    // only filled the 256-slot queue; a full queue then refused the voice outright.
+    const auto status = fileData.status.load();
+    const bool needsStream = status == FileData::Status::Preloaded
+                          || status == FileData::Status::GarbageCollecting;
+    if (!fileData.fullyLoaded && needsStream) {
         QueuedFileData queuedData { fileId, &fileData };
         if (!filesToLoad->try_push(queuedData)) {
+            // Still full: play from the preloaded head rather than dropping the note. The
+            // voice ends early only if it outruns the head before a later voice queues
+            // the stream.
             DBG("[sfizz] Could not enqueue the file to load for " << fileId << " (queue capacity " << filesToLoad->capacity() << ")");
-            return {};
+            return { &preloaded->second };
         }
 
         std::error_code ec;

@@ -831,6 +831,14 @@ void Voice::renderBlock(AudioSpan<float, 2> buffer) noexcept
     if (region == nullptr || region->disabled())
         return;
 
+    // A voice whose startVoice() failed (no file promise, disabled region) is left in
+    // cleanMeUp with region_ already set but its modulation targets still those of its
+    // previous region (or invalid on a fresh voice); ModMatrix then hands back nullptr for
+    // the amplitude EG and ampStage dereferenced it (organdroid: SIGSEGV under fast
+    // all-stop chords). Synth frees it right after this call; render nothing.
+    if (impl.state_ == State::cleanMeUp)
+        return;
+
     const auto delay = min(static_cast<size_t>(impl.initialDelay_), buffer.getNumFrames());
     auto delayed_buffer = buffer.subspan(delay);
     impl.initialDelay_ -= static_cast<int>(delay);
