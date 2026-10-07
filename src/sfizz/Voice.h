@@ -451,6 +451,7 @@ public:
      */
     float getCurrentPower() const noexcept;
     float getBaseGain() const noexcept;
+    float getBaseVolumedB() const noexcept;
 
     /**
      * @brief Force the next startVoice() to begin the sample at this source frame instead

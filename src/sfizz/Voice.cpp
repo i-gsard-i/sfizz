@@ -2169,6 +2169,11 @@ float Voice::getBaseGain() const noexcept
     return impl_->baseGain_;
 }
 
+float Voice::getBaseVolumedB() const noexcept
+{
+    return impl_->baseVolumedB_;
+}
+
 void Voice::setReleaseStartOverride(int sourceFrame) noexcept
 {
     impl_->releaseStartOverride_ = sourceFrame;

@@ -1361,7 +1361,18 @@ void Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& trigge
                 // ("ta-da"). Use the live output power vs the pipe's full (loop) level:
                 //   f = currentRMS / (baseGain * loopRms)   (both in (L+R) output units).
                 if (loopRms > 1e-6f) {
-                    const float full = attack->getBaseGain() * loopRms;
+                    // The power follower hears every gain of the amplitude stage, but
+                    // baseGain is only `amplitude`. Count the region's volume and its CC7
+                    // Volume connection in the full level too: sfizz connects CC7 to every
+                    // region by default (x² of 100/127 = 0.62), and without it a fully
+                    // spoken pipe reads as 62 % and its tail is turned down by that much.
+                    float full = attack->getBaseGain() * db2mag(attack->getBaseVolumedB()) * loopRms;
+                    const Region* ar = attack->getRegion();
+                    if (auto depth = ar->ccModDepth(7, ModId::Amplitude)) {
+                        const auto params = ar->ccModParameters(7, ModId::Amplitude);
+                        const Curve& curve = resources_.getCurves().getCurve(params->curve);
+                        full *= *depth * curve.evalNormalized(resources_.getMidiState().getCCValue(7));
+                    }
                     float f = (full > 1e-9f) ? std::sqrt(attack->getCurrentPower()) / full : 1.0f;
                     f = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
                     selectedVoice->setReleaseGainScale(f);
