@@ -875,7 +875,7 @@ void Voice::renderBlock(AudioSpan<float, 2> buffer) noexcept
     impl.age_ += buffer.getNumFrames();
     if (impl.triggerDelay_) {
         // Should be OK but just in case;
-        impl.age_ = min(impl.age_ - *impl.triggerDelay_, 0);
+        impl.age_ = max(impl.age_ - *impl.triggerDelay_, 0);
         impl.triggerDelay_ = absl::nullopt;
     }
 
