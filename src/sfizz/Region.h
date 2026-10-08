@@ -277,6 +277,22 @@ struct Region {
     // Owning stop's gate CC (Jukkasjarvi live registration, DivisionGate.h): custom
     // `stop_cc=N` opcode; -1 = untagged. Filtered note events act only on their stop.
     int gateCc { -1 }; // stop_cc
+    // Composite stops (Composite.h; organdroid docs/design/COMPOSITE_STOPS_DESIGN.md).
+    // `composite=N` marks a composite region: a pre-summed attack of several stops' pipes
+    // (an attack region) or its summed tail (trigger=release). Normal note dispatch skips
+    // them; the composite path starts them. -1 = an ordinary region.
+    int compositeId { -1 }; // composite
+    // On a composite attack: the handover time in frames (`composite_th`), the summed
+    // tail's sample (`composite_tail`) and each member pipe's sample (`composite_member`,
+    // once per member), with the same path rules as `sample`.
+    int compositeTh { 0 }; // composite_th
+    std::string compositeTail; // composite_tail
+    std::vector<std::string> compositeMembers; // composite_member
+    // The summed tail's scale by the note's age at the note-off (`composite_tailscale`,
+    // comma-separated): entry k holds after k power-follower steps of 512 frames, the last
+    // one past the end. Measured by the renderer on each member's own render, as each
+    // pipe's tail scale would have been, and added by their tails' power.
+    std::vector<float> compositeTailScale; // composite_tailscale
 
     // Region logic: key mapping
     UncheckedRange<uint8_t> keyRange { Default::loKey, Default::hiKey }; //lokey, hikey and key

@@ -96,6 +96,25 @@ public:
      */
     void stopDynamicUpdates() { dynamic_ = false; }
 
+    /**
+     * @brief Shape the linear attack and the linear release as an equal-power crossfade
+     * (composite stops, Composite.h): the attack ramp x is output as sin(pi/2 x), the
+     * linear release from its starting level v0 as v0 sin(pi/2 x/v0). A summed tail is
+     * not phase-aligned with the composite it replaces, and with phases that are
+     * effectively random the expected power of a·s + b·t is a² + b², so a² + b² = 1 keeps
+     * the level flat where a linear crossfade dips 3 dB. Set after setAttackTime() /
+     * setLinearReleaseTime(); reset() clears it.
+     */
+    void setEqualPower(bool on) noexcept { equalPower_ = on; }
+
+    /**
+     * @brief Take over another envelope's running state (composite handover,
+     * Composite.h): a member pipe started at the handover continues the composite's
+     * envelope exactly where it is. Both must have been reset from the same description;
+     * this envelope keeps its own description pointer.
+     */
+    void copyStateFrom(const ADSREnvelope& other) noexcept;
+
 private:
     float sampleRate { config::defaultSampleRate };
     int secondsToSamples(Float timeInSeconds) const noexcept;
@@ -135,6 +154,8 @@ private:
     bool shouldRelease { false };
     bool freeRunning { false };
     Float transitionDelta {};
+    bool equalPower_ { false };       // equal-power shape on the linear ramps (composite)
+    Float releaseFrom_ { 1 };         // the linear release's starting level
     LEAK_DETECTOR(ADSREnvelope);
 };
 

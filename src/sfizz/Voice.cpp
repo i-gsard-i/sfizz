@@ -18,6 +18,7 @@
 #include "ModifierHelpers.h"
 #include "RegionStateful.h"
 #include "ReleaseAlign.h"
+#include "Composite.h"
 #include "TriggerEvent.h"
 #include "modulations/ModId.h"
 #include "modulations/ModKey.h"
@@ -37,6 +38,8 @@
 #include "utility/Timing.h"
 #include <absl/algorithm/container.h>
 #include <absl/types/span.h>
+#include <array>
+#include <cmath>
 #include <random>
 #include <atomic>
 
@@ -258,6 +261,9 @@ struct Voice::Impl
     float releaseGainScale_ { 1.0f };   // release tail scaled to note's level at release
     uint32_t divMask_ { 0xFFFFFFFFu };  // division of the starting note event (DivisionGate.h)
     int gateCc_ { -1 };                 // starting region's stop gate CC (live registration)
+    const Layer* compositeLayer_ { nullptr };   // composite attack this voice plays (Composite.h)
+    std::array<FileDataHolder, kMaxCompositeMembers> compositeStreams_;
+    size_t numCompositeStreams_ { 0 };
     int initialDelay_ { 0 };
     int age_ { 0 };
     uint32_t count_ { 1 };
@@ -1772,6 +1778,10 @@ void Voice::reset() noexcept
     impl.releaseGainScale_ = 1.0f;
     impl.divMask_ = 0xFFFFFFFFu;
     impl.gateCc_ = -1;
+    impl.compositeLayer_ = nullptr;
+    for (size_t i = 0; i < impl.numCompositeStreams_; ++i)
+        impl.compositeStreams_[i].reset();
+    impl.numCompositeStreams_ = 0;
     impl.age_ = 0;
     impl.count_ = 1;
     impl.floatPositionOffset_ = 0.0f;
@@ -2202,6 +2212,86 @@ void Voice::setGateCc(int cc) noexcept
 int Voice::getGateCc() const noexcept
 {
     return impl_->gateCc_;
+}
+
+void Voice::setCompositeLayer(const Layer* layer) noexcept
+{
+    impl_->compositeLayer_ = layer;
+}
+
+const Layer* Voice::getCompositeLayer() const noexcept
+{
+    return impl_->compositeLayer_;
+}
+
+void Voice::holdCompositeStream(const std::shared_ptr<FileId>& fileId) noexcept
+{
+    Impl& impl = *impl_;
+    if (impl.numCompositeStreams_ >= impl.compositeStreams_.size())
+        return;
+    FileDataHolder holder = impl.resources_.getFilePool().getFilePromise(fileId);
+    if (holder)
+        impl.compositeStreams_[impl.numCompositeStreams_++] = std::move(holder);
+}
+
+void Voice::prepareCompositeRelease(float seconds) noexcept
+{
+    Impl& impl = *impl_;
+    impl.egAmplitude_.setLinearReleaseTime(seconds);
+    impl.egAmplitude_.setEqualPower(true);
+    impl.egAmplitude_.stopDynamicUpdates();
+}
+
+void Voice::takeOver(const Voice& composite) noexcept
+{
+    Impl& impl = *impl_;
+    const Impl& from = *composite.impl_;
+    const int frames = from.age_;
+
+    // The source frame this pipe would have reached. A voice plays its k-th frame at
+    // offset + ratio * k (fillWithData, the first frame read where it starts), and between
+    // blocks it holds the position of the last frame played. With age_ > 0 the next block
+    // steps on from there instead of restarting at the offset.
+    if (frames > 0) {
+        const double ratio = static_cast<double>(impl.pitchRatio_ * impl.speedRatio_);
+        const double last = static_cast<double>(impl.sourcePosition_) + ratio * static_cast<double>(frames - 1);
+        const double whole = std::floor(last);
+        impl.sourcePosition_ = static_cast<int>(whole);
+        impl.floatPositionOffset_ = static_cast<float>(last - whole);
+        impl.age_ = frames;
+        impl.triggerDelay_ = absl::nullopt;
+        impl.initialDelay_ = 0;
+    }
+
+    // The envelope and LFOs run the same descriptions in the composite and its members
+    // (the renderer only builds composites whose members share them), so their state is
+    // the composite's.
+    impl.egAmplitude_.copyStateFrom(from.egAmplitude_);
+    if (impl.egPitch_ && from.egPitch_)
+        impl.egPitch_->copyStateFrom(*from.egPitch_);
+    if (impl.egFilter_ && from.egFilter_)
+        impl.egFilter_->copyStateFrom(*from.egFilter_);
+    if (impl.lfoAmplitude_ && from.lfoAmplitude_)
+        impl.lfoAmplitude_->copyStateFrom(*from.lfoAmplitude_);
+    if (impl.lfoPitch_ && from.lfoPitch_)
+        impl.lfoPitch_->copyStateFrom(*from.lfoPitch_);
+    if (impl.lfoFilter_ && from.lfoFilter_)
+        impl.lfoFilter_->copyStateFrom(*from.lfoFilter_);
+    for (size_t i = 0, n = std::min(impl.lfos_.size(), from.lfos_.size()); i < n; ++i)
+        impl.lfos_[i]->copyStateFrom(*from.lfos_[i]);
+
+    impl.noteIsOff_ = from.noteIsOff_;
+    impl.offed_ = from.offed_;
+}
+
+void Voice::takeOverPower(const Voice& composite, float share) noexcept
+{
+    impl_->powerFollower_.copyScaledFrom(composite.impl_->powerFollower_, share);
+}
+
+bool Voice::isNoteOff() const noexcept
+{
+    return impl_->noteIsOff_;
 }
 
 unsigned Voice::getStartTimestampSamples() const noexcept

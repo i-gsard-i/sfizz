@@ -8,6 +8,7 @@
 #include "ADSREnvelope.h"
 #include "TriggerEvent.h"
 #include "Region.h"
+#include "FileId.h"
 #include "Resources.h"
 #include "AudioSpan.h"
 #include "utility/NumericId.h"
@@ -483,6 +484,46 @@ public:
      */
     void setGateCc(int cc) noexcept;
     int getGateCc() const noexcept;
+
+    /**
+     * @brief Composite stops (Composite.h). A composite voice plays a composite attack
+     * layer; nullptr (the default, restored every reset()) = an ordinary voice.
+     */
+    void setCompositeLayer(const Layer* layer) noexcept;
+    const Layer* getCompositeLayer() const noexcept;
+
+    /**
+     * @brief Request a member pipe's stream at the composite's note-on and hold it until
+     * the handover, so the member's file is read from the moment it would have been in
+     * live playing. Dropped by reset().
+     */
+    void holdCompositeStream(const std::shared_ptr<FileId>& fileId) noexcept;
+
+    /**
+     * @brief Fade this composite voice out over `seconds` as the equal-power half of its
+     * crossfade into the summed tail. Call before registerNoteOff().
+     */
+    void prepareCompositeRelease(float seconds) noexcept;
+
+    /**
+     * @brief Continue a composite voice as this member pipe (the handover). Call right
+     * after startVoice() on the member's layer, between blocks: the member is moved to the
+     * source frame it would have reached after the composite's frames played, and takes
+     * over the composite's envelope and LFO state and its note-off.
+     */
+    void takeOver(const Voice& composite) noexcept;
+
+    /**
+     * @brief Start this member's power follower at `share` of the composite's power: its
+     * part of the sum, until the follower has heard the member's own output. A release
+     * just after the handover then scales its tail as live playing would.
+     */
+    void takeOverPower(const Voice& composite, float share) noexcept;
+
+    /**
+     * @brief Whether the note that started this voice has been released.
+     */
+    bool isNoteOff() const noexcept;
 
     /**
      * @brief Get the timestamp in midistate transport sample time when the voice was started, in samples

@@ -58,8 +58,13 @@ struct VoiceManager final : public Voice::StateListener
      * @brief Return the compatible attack voice playing for a release region, or nullptr.
      * Used by the phase-aligned release path to read the live loop position of the
      * sustain voice being released (ReleaseAlign.h).
+     *
+     * With several stops drawn every one of them has an attack voice on the key, so the
+     * voice must be the tail's own pipe: the same stop (gate CC, when the region has one)
+     * sounding for one of the note-off's divisions. Of those, the youngest: an older
+     * strike of the same key may still be fading.
      */
-    Voice* findAttackVoice(const Region* releaseRegion) noexcept;
+    Voice* findAttackVoice(const Region* releaseRegion, uint32_t divMask = 0xFFFFFFFFu) noexcept;
 
     /**
      * @brief Ensures that the polyphony groups are at least this size.

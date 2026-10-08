@@ -17,6 +17,9 @@ public:
     void setSamplesPerBlock(unsigned samplesPerBlock);
     void process(AudioSpan<float> buffer) noexcept;
     void clear() noexcept;
+    // Start from another follower's state scaled by `weight` (a composite member taking
+    // over a share of the composite's power, Composite.h).
+    void copyScaledFrom(const PowerFollower& other, float weight) noexcept;
     float getAveragePower() const noexcept { return currentPower_; }
 
 private:

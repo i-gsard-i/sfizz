@@ -152,6 +152,22 @@ public:
 
     Region region_;
 
+    // Composite stops (Composite.h): on a composite attack layer, its summed tail and its
+    // member pipes, resolved by sample path when the SFZ is loaded. `valid` only when the
+    // tail and every member were found.
+    struct CompositeLink {
+        bool valid { false };
+        Layer* tail { nullptr };
+        std::vector<Layer*> members;
+        uint64_t memberCcs[2] {};   // one bit per member's stop gate CC
+        mutable float fullLevel { -1.0f };  // sqrt(sum of (amplitude * volume * loop rms)^2), lazily
+        mutable std::vector<float> memberLevels;  // each member's amplitude * volume * loop rms
+        bool hasMemberCc(int cc) const noexcept
+        {
+            return cc >= 0 && cc < 128 && ((memberCcs[cc >> 6] >> (cc & 63)) & 1u);
+        }
+    } composite_;
+
     LEAK_DETECTOR(Layer);
 };
 

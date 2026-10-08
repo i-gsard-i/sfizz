@@ -18,6 +18,7 @@
 #include "RegionSet.h"
 #include "ReleaseAlign.h"
 #include "DivisionGate.h"
+#include "Composite.h"
 #include "Resources.h"
 #include "BufferPool.h"
 #include "FilePool.h"
@@ -279,6 +280,8 @@ void Synth::Impl::clear()
     for (auto& list : upKeyswitchLists_)
         list.clear();
     for (auto& list : noteActivationLists_)
+        list.clear();
+    for (auto& list : compositeLists_)
         list.clear();
     for (auto& list : ccActivationLists_)
         list.clear();
@@ -837,8 +840,14 @@ void Synth::Impl::finalizeSfzLoad()
         }
 
         for (auto note = 0; note < 128; note++) {
-            if (region.keyRange.containsWithEnd(note))
+            if (!region.keyRange.containsWithEnd(note))
+                continue;
+            // Composite regions (Composite.h) are started only by the composite path:
+            // the attacks are listed apart, the summed tails nowhere.
+            if (region.compositeId < 0)
                 noteActivationLists_[note].push_back(&layer);
+            else if (!region.isRelease())
+                compositeLists_[note].push_back(&layer);
         }
 
         for (int cc = 0; cc < config::numCCs; cc++) {
@@ -917,6 +926,7 @@ void Synth::Impl::finalizeSfzLoad()
             << " out of " << layers_.size() << " regions");
     }
     layers_.resize(currentRegionCount);
+    resolveComposites();
 
     // collect all CCs used in regions, with matrix not yet connected
     BitArray<config::numCCs> usedCCs;
@@ -1145,6 +1155,16 @@ void Synth::renderBlock(AudioSpan<float> buffer) noexcept
         return;
     }
 
+    // Composite stops (Composite.h): a composite voice that would play past its handover
+    // time in this block hands over to its member pipes before the block, so the members
+    // take over at a block boundary, as live note events start.
+    for (auto& voice : impl.voiceManager_) {
+        const Layer* layer = voice.getCompositeLayer();
+        if (layer != nullptr && !voice.isFree()
+            && voice.getAge() + static_cast<int>(numFrames) > layer->getRegion().compositeTh)
+            impl.handOverComposite(voice);
+    }
+
     ModMatrix& mm = impl.resources_.getModMatrix();
     mm.beginCycle(numFrames);
 
@@ -1315,24 +1335,67 @@ void Synth::hdNoteOff(int delay, int noteNumber, float normalizedVelocity) noexc
     impl.dispatchDivMask_ = divisionConsumeMask();
     impl.dispatchStopCc_ = stopConsumeFilter();
 
+    const auto isCompositeOnNote = [&](const Voice& voice) {
+        const TriggerEvent& event = voice.getTriggerEvent();
+        return voice.getCompositeLayer() != nullptr && !voice.isFree()
+            && event.type == TriggerEventType::NoteOn && event.number == noteNumber
+            && (voice.getDivisionMask() & impl.dispatchDivMask_) != 0;
+    };
+
+    // Composite stops (Composite.h): a stop retired from a held note hands the note's
+    // composite over first, so that stop's own voice exists to be released below.
+    if (impl.dispatchStopCc_ >= 0) {
+        for (auto& voice : impl.voiceManager_)
+            if (isCompositeOnNote(voice)
+                && voice.getCompositeLayer()->composite_.hasMemberCc(impl.dispatchStopCc_))
+                impl.handOverComposite(voice);
+    }
+
+    // A composite released by this note-off fades into its summed tail, when tails are on
+    // and its tail region's conditions (the tails CC) hold. Its members' own release regions
+    // must not start: their tails are in the sum.
+    std::array<std::pair<Voice*, Layer*>, 16> compositeTails;
+    size_t numCompositeTails = 0;
+    impl.dispatchSuppressCc_[0] = impl.dispatchSuppressCc_[1] = 0;
+    if (impl.dispatchStopCc_ < 0) {
+        for (auto& voice : impl.voiceManager_) {
+            if (!isCompositeOnNote(voice) || voice.isNoteOff())
+                continue;
+            const Layer::CompositeLink& link = voice.getCompositeLayer()->composite_;
+            impl.dispatchSuppressCc_[0] |= link.memberCcs[0];
+            impl.dispatchSuppressCc_[1] |= link.memberCcs[1];
+            Layer* tail = link.tail;
+            if (tail && sfz::releaseAlignEnabled() && numCompositeTails < compositeTails.size()
+                && tail->registerNoteOff(noteNumber, replacedVelocity,
+                                         impl.randNoteDistribution_(Random::randomGenerator))) {
+                voice.prepareCompositeRelease(sfz::releaseAlignCrossfade());
+                compositeTails[numCompositeTails++] = { &voice, tail };
+            }
+        }
+    }
+
     for (auto& voice : impl.voiceManager_)
         if ((voice.getDivisionMask() & impl.dispatchDivMask_) != 0
             && (impl.dispatchStopCc_ < 0 || voice.getGateCc() == impl.dispatchStopCc_))
             voice.registerNoteOff(delay, noteNumber, replacedVelocity);
 
+    for (size_t i = 0; i < numCompositeTails; ++i)
+        impl.startCompositeTail(*compositeTails[i].first, compositeTails[i].second, delay, replacedVelocity);
+
     impl.noteOffDispatch(delay, noteNumber, replacedVelocity);
+    impl.dispatchSuppressCc_[0] = impl.dispatchSuppressCc_[1] = 0;
     impl.dispatchDivMask_ = kDivisionAll;
     impl.dispatchStopCc_ = kStopFilterNone;
 }
 
-void Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& triggerEvent, SisterVoiceRingBuilder& ring) noexcept
+Voice* Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& triggerEvent, SisterVoiceRingBuilder& ring) noexcept
 {
     const Region& region = layer->getRegion();
 
     voiceManager_.checkPolyphony(&region, delay, triggerEvent);
     Voice* selectedVoice = voiceManager_.findFreeVoice();
     if (selectedVoice == nullptr)
-        return;
+        return nullptr;
 
     selectedVoice->reset();
 
@@ -1342,8 +1405,8 @@ void Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& trigge
     // ATTACK sample (the one whose live loop position we can read), so look it up via the
     // attack voice currently sounding this note.
     bool releaseAligned = false;
-    if (sfz::releaseAlignEnabled() && region.isRelease()) {
-        if (Voice* attack = voiceManager_.findAttackVoice(&region)) {
+    if (sfz::releaseAlignEnabled() && region.isRelease() && region.compositeId < 0) {
+        if (Voice* attack = voiceManager_.findAttackVoice(&region, dispatchDivMask_)) {
             float period = 0.0f; int anchor = 0; float loopRms = 0.0f;
             const uint8_t* track = nullptr; size_t trackSize = 0;
             if (sfz::releaseAlignLookup(attack->getRegion()->sampleId->filename(), period, anchor, loopRms,
@@ -1408,7 +1471,171 @@ void Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& trigge
             }
         }
         ring.addVoiceToRing(selectedVoice);
+        return selectedVoice;
     }
+    return nullptr;
+}
+
+void Synth::Impl::resolveComposites() noexcept
+{
+    absl::flat_hash_map<std::string, Layer*> attacks;
+    absl::flat_hash_map<std::string, Layer*> tails;
+    bool any = false;
+    for (const LayerPtr& layerPtr : layers_) {
+        const Region& region = layerPtr->getRegion();
+        layerPtr->composite_ = Layer::CompositeLink {};
+        if (region.isOscillator() || !region.sampleId)
+            continue;
+        const std::string name { region.sampleId->filename() };
+        if (region.compositeId >= 0) {
+            any = true;
+            if (region.isRelease())
+                tails.emplace(name, layerPtr.get());
+        } else if (!region.isRelease()) {
+            attacks.emplace(name, layerPtr.get());
+        }
+    }
+    if (!any)
+        return;
+
+    for (const LayerPtr& layerPtr : layers_) {
+        const Region& region = layerPtr->getRegion();
+        if (region.compositeId < 0 || region.isRelease())
+            continue;
+        Layer::CompositeLink& link = layerPtr->composite_;
+        bool ok = region.compositeTh > 0 && !region.compositeMembers.empty()
+            && region.compositeMembers.size() <= kMaxCompositeMembers;
+        if (ok && !region.compositeTail.empty()) {
+            const auto it = tails.find(region.compositeTail);
+            ok = it != tails.end();
+            if (ok)
+                link.tail = it->second;
+        }
+        for (size_t i = 0; ok && i < region.compositeMembers.size(); ++i) {
+            const auto it = attacks.find(region.compositeMembers[i]);
+            // A member must carry its stop's gate CC: that is how its own pipes are kept
+            // silent while the composite plays them.
+            ok = it != attacks.end() && it->second->getRegion().gateCc >= 0;
+            if (ok) {
+                const int cc = it->second->getRegion().gateCc;
+                link.members.push_back(it->second);
+                link.memberLevels.reserve(region.compositeMembers.size());
+                link.memberCcs[cc >> 6] |= uint64_t { 1 } << (cc & 63);
+            }
+        }
+        link.valid = ok;
+        if (!ok) {
+            DBG("[sfizz] Composite region " << region.sampleId->filename() << " is not used: "
+                << "its tail or a member is missing, or a member has no stop_cc");
+            link.members.clear();
+            link.tail = nullptr;
+            link.memberCcs[0] = link.memberCcs[1] = 0;
+        }
+    }
+}
+
+void Synth::Impl::compositeLevels(const Layer::CompositeLink& link) noexcept
+{
+    // Each member's full level as the tail scale counts it (its region's amplitude and
+    // volume, and its loop's rms from the release-alignment table) and the sum's, added in
+    // power. Once per composite region; 0 when a member has no table entry.
+    if (link.fullLevel >= 0.0f)
+        return;
+    double sum = 0.0;
+    bool known = true;
+    link.memberLevels.clear();
+    for (const Layer* member : link.members) {
+        const Region& r = member->getRegion();
+        float period = 0.0f, loopRms = 0.0f; int anchor = 0;
+        const uint8_t* track = nullptr; size_t trackSize = 0;
+        if (!sfz::releaseAlignLookup(std::string(r.sampleId->filename()), period, anchor, loopRms, track, trackSize)) {
+            known = false;
+            break;
+        }
+        const double a = static_cast<double>(r.getBaseGain()) * db2mag(r.volume) * loopRms;
+        link.memberLevels.push_back(static_cast<float>(a));
+        sum += a * a;
+    }
+    if (!known)
+        link.memberLevels.clear();
+    link.fullLevel = known ? static_cast<float>(std::sqrt(sum)) : 0.0f;
+}
+
+void Synth::Impl::handOverComposite(Voice& composite) noexcept
+{
+    const Layer* layer = composite.getCompositeLayer();
+    if (layer == nullptr || composite.isFree())
+        return;
+    const Layer::CompositeLink& link = layer->composite_;
+    compositeLevels(link);
+    const TriggerEvent event = composite.getTriggerEvent();
+    const uint32_t divisions = composite.getDivisionMask();
+    SisterVoiceRingBuilder ring;
+
+    std::array<Voice*, kMaxCompositeMembers> started {};
+    const size_t n = std::min(link.members.size(), started.size());
+    for (size_t i = 0; i < n; ++i)
+        started[i] = startVoice(link.members[i], 0, event, ring);
+
+    // Starting a voice can steal one when none is free; if that was the composite itself,
+    // its state is gone and the members simply start from their own beginning.
+    if (composite.getCompositeLayer() == layer) {
+        const float fullSq = link.fullLevel * link.fullLevel;
+        for (size_t i = 0; i < n; ++i) {
+            if (started[i] == nullptr)
+                continue;
+            started[i]->takeOver(composite);
+            const float share = (fullSq > 0.0f && i < link.memberLevels.size())
+                ? link.memberLevels[i] * link.memberLevels[i] / fullSq
+                : 1.0f / static_cast<float>(n);
+            started[i]->takeOverPower(composite, share);
+        }
+        composite.reset();
+    }
+    for (size_t i = 0; i < n; ++i)
+        if (started[i] != nullptr)
+            started[i]->setDivisionMask(divisions & link.members[i]->getRegion().divMask);
+}
+
+void Synth::Impl::startCompositeTail(Voice& composite, Layer* tail, int delay, float velocity) noexcept
+{
+    const Layer* layer = composite.getCompositeLayer();
+    if (layer == nullptr)
+        return;
+
+    // The tail scale, as each pipe's tail gets it (startVoice, release alignment): the
+    // note's current level against its full level. Each member would have had its own; the
+    // renderer measured them on each member's render and added them by their tails' power,
+    // one value per power-follower step of the note's age (Region::compositeTailScale). The
+    // composite's own power cannot stand for them: members at different stages of their
+    // speech give one sum, and its volume= holds the file's storage gain.
+    float scale = 1.0f;
+    const auto& table = layer->getRegion().compositeTailScale;
+    if (!table.empty()) {
+        const size_t k = static_cast<size_t>(std::max(composite.getAge(), 0)) / config::powerFollowerStep;
+        scale = table[std::min(k, table.size() - 1)];
+        scale = scale < 0.0f ? 0.0f : (scale > 1.0f ? 1.0f : scale);
+    }
+
+    const Region& region = tail->getRegion();
+    const TriggerEvent event { TriggerEventType::NoteOff, composite.getTriggerEvent().number, velocity };
+    voiceManager_.checkPolyphony(&region, delay, event);
+    Voice* voice = voiceManager_.findFreeVoice();
+    if (voice == nullptr)
+        return;
+    voice->reset();
+    voice->setReleaseGainScale(scale);
+    if (!voice->startVoice(tail, delay, event))
+        return;
+    voice->setDivisionMask(composite.getDivisionMask() & region.divMask);
+    voice->setGateCc(region.gateCc);
+    if (ADSREnvelope* eg = voice->getAmplitudeEG()) {
+        eg->setAttackTime(sfz::releaseAlignCrossfade());
+        eg->setEqualPower(true);
+        eg->stopDynamicUpdates();
+    }
+    SisterVoiceRingBuilder ring;
+    ring.addVoiceToRing(voice);
 }
 
 void Synth::Impl::checkOffGroups(const Region* region, int delay, int number, bool chokedByCC)
@@ -1440,6 +1667,8 @@ void Synth::Impl::noteOffDispatch(int delay, int noteNumber, float velocity) noe
             continue;
         if (dispatchStopCc_ >= 0 && region.gateCc != dispatchStopCc_)   // live registration
             continue;
+        if (region.gateCc >= 0 && ((dispatchSuppressCc_[region.gateCc >> 6] >> (region.gateCc & 63)) & 1u))
+            continue;   // a composite member: its tail is in the summed tail (Composite.h)
         if (layer->registerNoteOff(noteNumber, velocity, randValue)) {
             if (region.trigger == Trigger::release && !region.rtDead && !voiceManager_.playingAttackVoice(&region))
                 continue;
@@ -1473,11 +1702,44 @@ void Synth::Impl::noteOnDispatch(int delay, int noteNumber, float velocity) noex
     for (Layer* layer : downKeyswitchLists_[noteNumber])
         layer->keySwitched_ = true;
 
+    // Composite stops (Composite.h): where the app has activated a composite for one of
+    // this note's divisions, one composite voice (a random draw among its regions for the
+    // key) plays instead of its member pipes, which are skipped below. It requests their
+    // streams now, so they are read as early as in live playing. A retro attack (stop
+    // filter) is a single stop's pipe and never a composite.
+    uint64_t suppress[2] {};
+    if (dispatchStopCc_ < 0 && compositeAnyActive()) {
+        for (Layer* layer : compositeLists_[noteNumber]) {
+            const Region& region = layer->getRegion();
+            const Layer::CompositeLink& link = layer->composite_;
+            const uint32_t divisions = region.divMask & dispatchDivMask_;
+            if (!link.valid || divisions == 0)
+                continue;
+            bool active = false;
+            for (int d = 0; d < 32 && !active; ++d)
+                active = ((divisions >> d) & 1u) && compositeActive(d) == region.compositeId;
+            if (!active || !layer->registerNoteOn(noteNumber, velocity, randValue))
+                continue;
+            const TriggerEvent triggerEvent { TriggerEventType::NoteOn, noteNumber, velocity };
+            Voice* voice = startVoice(layer, delay, triggerEvent, ring);
+            if (voice == nullptr)
+                continue;   // no voice: the members play live
+            voice->setCompositeLayer(layer);
+            for (const Layer* member : link.members)
+                voice->holdCompositeStream(member->getRegion().sampleId);
+            suppress[0] |= link.memberCcs[0];
+            suppress[1] |= link.memberCcs[1];
+        }
+    }
+
     for (Layer* layer : noteActivationLists_[noteNumber]) {
         if ((layer->getRegion().divMask & dispatchDivMask_) == 0)   // DivisionGate.h
             continue;
         if (dispatchStopCc_ >= 0 && layer->getRegion().gateCc != dispatchStopCc_)   // live registration
             continue;
+        const int gateCc = layer->getRegion().gateCc;
+        if (gateCc >= 0 && ((suppress[gateCc >> 6] >> (gateCc & 63)) & 1u))
+            continue;   // played by the composite
         if (layer->registerNoteOn(noteNumber, velocity, randValue)) {
             const Region& region = layer->getRegion();
             if (region.useTimerRange && !voiceManager_.withinValidTimerRange(&region, midiState.getInternalClock() + delay, sampleRate_))

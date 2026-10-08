@@ -79,6 +79,13 @@ public:
      */
     void process(absl::Span<float> out);
 
+    /**
+       Take over another LFO's running state: delay left, fade-in and phases (composite
+       handover, Composite.h). A member pipe started at the handover continues the
+       composite's tremulant in phase. Both must run the same description.
+     */
+    void copyStateFrom(const LFO& other);
+
 private:
     /**
        Evaluate the wave at a given phase.

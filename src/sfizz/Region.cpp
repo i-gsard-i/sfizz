@@ -16,6 +16,7 @@
 #include "absl/strings/str_replace.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
+#include "absl/strings/str_split.h"
 #include "absl/strings/match.h"
 #include "absl/algorithm/container.h"
 #include <random>
@@ -195,6 +196,42 @@ bool sfz::Region::parseOpcode(const Opcode& rawOpcode, bool cleanOpcode)
         int cc {};
         if (absl::SimpleAtoi(opcode.value, &cc) && cc >= 0 && cc < 128)
             gateCc = cc;
+        break;
+    }
+    case hash("composite"): { // composite stops (Composite.h)
+        int id {};
+        if (absl::SimpleAtoi(opcode.value, &id) && id >= 0)
+            compositeId = id;
+        break;
+    }
+    case hash("composite_th"): {
+        int frames {};
+        if (absl::SimpleAtoi(opcode.value, &frames) && frames > 0)
+            compositeTh = frames;
+        break;
+    }
+    case hash("composite_tailscale"): {
+        compositeTailScale.clear();
+        for (absl::string_view v : absl::StrSplit(opcode.value, ',')) {
+            float x {};
+            if (!absl::SimpleAtof(trim(v), &x)) {
+                compositeTailScale.clear();
+                break;
+            }
+            compositeTailScale.push_back(x);
+        }
+        break;
+    }
+    case hash("composite_tail"):
+    case hash("composite_member"): {
+        const auto trimmed = trim(opcode.value);
+        if (trimmed.empty())
+            break;
+        std::string filename = absl::StrCat(defaultPath, absl::StrReplaceAll(trimmed, { { "\\", "/" } }));
+        if (opcode.lettersOnlyHash == hash("composite_tail"))
+            compositeTail = std::move(filename);
+        else
+            compositeMembers.push_back(std::move(filename));
         break;
     }
     case hash("output"):

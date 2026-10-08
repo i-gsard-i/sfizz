@@ -65,20 +65,25 @@ void VoiceManager::reset()
     setStealingAlgorithm(StealingAlgorithm::Oldest);
 }
 
-Voice* VoiceManager::findAttackVoice(const Region* releaseRegion) noexcept
+Voice* VoiceManager::findAttackVoice(const Region* releaseRegion, uint32_t divMask) noexcept
 {
-    const auto compatibleVoice = [releaseRegion](const Voice& v) -> bool {
+    const auto compatibleVoice = [releaseRegion, divMask](const Voice& v) -> bool {
         const TriggerEvent& event = v.getTriggerEvent();
         return (
             !v.isFree()
             && event.type == TriggerEventType::NoteOn
             && releaseRegion->keyRange.containsWithEnd(event.number)
             && releaseRegion->velocityRange.containsWithEnd(event.value)
+            && (releaseRegion->gateCc < 0 || v.getGateCc() == releaseRegion->gateCc)
+            && (v.getDivisionMask() & divMask) != 0
         );
     };
 
-    auto it = absl::c_find_if(list_, compatibleVoice);
-    return it == list_.end() ? nullptr : &(*it);
+    Voice* found = nullptr;
+    for (Voice& v : list_)
+        if (compatibleVoice(v) && (found == nullptr || v.getAge() < found->getAge()))
+            found = &v;
+    return found;
 }
 
 bool VoiceManager::playingAttackVoice(const Region* releaseRegion) noexcept

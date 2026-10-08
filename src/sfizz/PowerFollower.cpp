@@ -81,6 +81,13 @@ void PowerFollower::process(AudioSpan<float> buffer) noexcept
     currentCount_ = currentCount;
 }
 
+void PowerFollower::copyScaledFrom(const PowerFollower& other, float weight) noexcept
+{
+    currentPower_ = other.currentPower_ * weight;
+    currentSum_ = other.currentSum_ * weight;
+    currentCount_ = other.currentCount_;
+}
+
 void PowerFollower::clear() noexcept
 {
     currentPower_ = 0;

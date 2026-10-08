@@ -49,6 +49,7 @@ void ADSREnvelope::reset(const EGDescription& desc, const Region& region, int de
     releaseDelay = 0;
     shouldRelease = false;
     linearRelease = false;
+    equalPower_ = false;
     freeRunning = (
         (this->sustain <= Float(config::sustainFreeRunningThreshold))
         || (region.loopMode == LoopMode::one_shot && region.isOscillator())
@@ -129,8 +130,13 @@ void ADSREnvelope::getBlockInternal(absl::Span<Float> output) noexcept
                 currentState = State::Attack;
             break;
         case State::Attack:
-            while (count < size && (currentValue += attackStep) < 1)
-                output[count++] = currentValue;
+            if (equalPower_) {
+                while (count < size && (currentValue += attackStep) < 1)
+                    output[count++] = std::sin(Float(1.5707963267948966) * currentValue);
+            } else {
+                while (count < size && (currentValue += attackStep) < 1)
+                    output[count++] = currentValue;
+            }
             if (currentValue >= 1) {
                 currentValue = 1;
                 currentState = State::Hold;
@@ -164,7 +170,11 @@ void ADSREnvelope::getBlockInternal(absl::Span<Float> output) noexcept
             break;
         case State::Release:
             previousValue = currentValue;
-            if (linearRelease) {
+            if (linearRelease && equalPower_) {
+                const Float v0 = releaseFrom_;
+                while (count < size && (currentValue -= releaseStep) > config::egReleaseThreshold)
+                    output[count++] = previousValue = v0 * std::sin(Float(1.5707963267948966) * currentValue / v0);
+            } else if (linearRelease) {
                 while (count < size && (currentValue -= releaseStep) > config::egReleaseThreshold)
                     output[count++] = previousValue = currentValue;
             } else {
@@ -234,7 +244,33 @@ void ADSREnvelope::setLinearReleaseTime(Float timeInSeconds) noexcept
     // crossfade window regardless of how far the attack had progressed (short notes
     // release mid-onset at <1.0). Keeps it complementary to the release voice's fade-in.
     const Float samples = std::max(Float(1), sampleRate * timeInSeconds);
-    releaseStep = std::max(currentValue, config::egReleaseThreshold) / samples;
+    releaseFrom_ = std::max(currentValue, config::egReleaseThreshold);
+    releaseStep = releaseFrom_ / samples;
+}
+
+void ADSREnvelope::copyStateFrom(const ADSREnvelope& other) noexcept
+{
+    sampleRate = other.sampleRate;
+    currentState = other.currentState;
+    currentValue = other.currentValue;
+    triggerVelocity_ = other.triggerVelocity_;
+    dynamic_ = other.dynamic_;
+    delay = other.delay;
+    attackStep = other.attackStep;
+    decayRate = other.decayRate;
+    releaseRate = other.releaseRate;
+    releaseStep = other.releaseStep;
+    linearRelease = other.linearRelease;
+    hold = other.hold;
+    start = other.start;
+    sustain = other.sustain;
+    sustainThreshold = other.sustainThreshold;
+    releaseDelay = other.releaseDelay;
+    shouldRelease = other.shouldRelease;
+    freeRunning = other.freeRunning;
+    transitionDelta = other.transitionDelta;
+    equalPower_ = other.equalPower_;
+    releaseFrom_ = other.releaseFrom_;
 }
 
 void ADSREnvelope::setAttackTime(Float timeInSeconds) noexcept

@@ -72,6 +72,18 @@ void LFO::configure(const LFODescription* desc)
     impl.phaseKeyId = modMatrix.findTarget(desc->phaseKey);
 }
 
+void LFO::copyStateFrom(const LFO& other)
+{
+    Impl& impl = *impl_;
+    const Impl& o = *other.impl_;
+    impl.delayFramesLeft_ = o.delayFramesLeft_;
+    impl.fadeTime_ = o.fadeTime_;
+    impl.fadePosition_ = o.fadePosition_;
+    impl.subPhases_ = o.subPhases_;
+    impl.sampleHoldMem_ = o.sampleHoldMem_;
+    impl.sampleHoldState_ = o.sampleHoldState_;
+}
+
 void LFO::start(unsigned triggerDelay)
 {
     Impl& impl = *impl_;

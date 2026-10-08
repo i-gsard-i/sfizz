@@ -2,36 +2,40 @@
 // See DivisionGate.h.
 
 #include "DivisionGate.h"
-#include <atomic>
 
 namespace {
-// Producer and consumer are the same (render) thread -- the engine sets the mask right
-// before calling noteOn/noteOff, which dispatches synchronously. Atomic anyway: it is
-// cheap, and it keeps a stray off-thread caller merely harmless instead of UB.
-std::atomic<uint32_t> g_nextMask { sfz::kDivisionAll };
-std::atomic<int>      g_nextStop { sfz::kStopFilterNone };
+// Producer and consumer are the same thread -- the engine sets the mask right before
+// calling noteOn/noteOff, which dispatches synchronously. Per thread, so a second synth
+// on another thread (the composite renderer) never takes the render thread's pending
+// mask, nor the render thread its own.
+thread_local uint32_t g_nextMask { sfz::kDivisionAll };
+thread_local int      g_nextStop { sfz::kStopFilterNone };
 }
 
 extern "C" void sfizz_division_next_mask(uint32_t mask)
 {
-    g_nextMask.store(mask, std::memory_order_relaxed);
+    g_nextMask = mask;
 }
 
 extern "C" void sfizz_stop_next_filter(int cc)
 {
-    g_nextStop.store(cc, std::memory_order_relaxed);
+    g_nextStop = cc;
 }
 
 namespace sfz {
 
 uint32_t divisionConsumeMask() noexcept
 {
-    return g_nextMask.exchange(kDivisionAll, std::memory_order_relaxed);
+    const uint32_t mask = g_nextMask;
+    g_nextMask = kDivisionAll;
+    return mask;
 }
 
 int stopConsumeFilter() noexcept
 {
-    return g_nextStop.exchange(kStopFilterNone, std::memory_order_relaxed);
+    const int cc = g_nextStop;
+    g_nextStop = kStopFilterNone;
+    return cc;
 }
 
 } // namespace sfz

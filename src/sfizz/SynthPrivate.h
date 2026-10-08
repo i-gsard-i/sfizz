@@ -163,7 +163,30 @@ struct Synth::Impl final: public Parser::Listener {
      * @param triggerEvent
      * @param ring
      */
-    void startVoice(Layer* layer, int delay, const TriggerEvent& triggerEvent, SisterVoiceRingBuilder& ring) noexcept;
+    Voice* startVoice(Layer* layer, int delay, const TriggerEvent& triggerEvent, SisterVoiceRingBuilder& ring) noexcept;
+
+    /**
+     * @brief Composite stops (Composite.h): link every composite attack layer to its
+     * summed tail and member layers by sample path. Called once the layers are final.
+     */
+    void resolveComposites() noexcept;
+
+    /**
+     * @brief Hand a composite voice over to its member pipes, between blocks: each member
+     * starts where it would be after the composite's frames, and the composite stops.
+     */
+    void handOverComposite(Voice& composite) noexcept;
+
+    /**
+     * @brief Fill in a composite link's member levels and full level, once.
+     */
+    void compositeLevels(const Layer::CompositeLink& link) noexcept;
+
+    /**
+     * @brief Start the summed tail of a composite voice released by a note-off, scaled to
+     * the note's level and faded in with the equal-power half of the crossfade.
+     */
+    void startCompositeTail(Voice& composite, Layer* tail, int delay, float velocity) noexcept;
 
     /**
      * @brief Start all delayed sustain release voices of the region if necessary
@@ -309,6 +332,9 @@ struct Synth::Impl final: public Parser::Listener {
     std::array<LayerViewVector, 128> upKeyswitchLists_;
     LayerViewVector previousKeyswitchLists_;
     std::array<LayerViewVector, 128> noteActivationLists_;
+    // Composite attack layers per key (Composite.h); kept out of noteActivationLists_,
+    // since only the composite path starts them.
+    std::array<LayerViewVector, 128> compositeLists_;
     std::array<LayerViewVector, config::numCCs> ccActivationLists_;
 
     // Effect factory and buses
@@ -372,6 +398,10 @@ struct Synth::Impl final: public Parser::Listener {
     // live registration, DivisionGate.h). >= 0: the event acts only on regions/voices
     // whose stop_cc matches. Same consume/restore discipline as the division mask.
     int dispatchStopCc_ { -1 };
+    // Stops whose release regions the note-off being dispatched must not start, one bit
+    // per gate CC: the members of a composite this note-off releases, whose tails are in
+    // the summed tail (Composite.h). Cleared after the dispatch.
+    uint64_t dispatchSuppressCc_[2] {};
 
     std::chrono::time_point<std::chrono::high_resolution_clock> lastGarbageCollection_;
 
