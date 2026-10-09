@@ -1063,11 +1063,41 @@ void Voice::Impl::panStageStereo(AudioSpan<float> buffer) noexcept
 
     ModMatrix& mm = resources_.getModMatrix();
 
+    // Pan, width and position unchanging over the block (an organ pipe's case, and the
+    // spread knob's between moves): the stages below and their +6 dB as one matrix,
+    // from the same table entries (Panning.h, stereoMatrix).
+    const float* panMod = mm.getModulation(panTarget_);
+    const float* widthMod = mm.getModulation(widthTarget_);
+    const float* positionMod = mm.getModulation(positionTarget_);
+    const auto constant = [numSamples](const float* mod) {
+        if (mod == nullptr)
+            return true;
+        for (size_t i = 1; i < numSamples; ++i)
+            if (mod[i] != mod[0])
+                return false;
+        return true;
+    };
+    if (numSamples > 0 && constant(panMod) && constant(widthMod) && constant(positionMod)) {
+        float m[4];
+        stereoMatrix(region_->pan + (panMod ? panMod[0] : 0.0f),
+                     region_->width + (widthMod ? widthMod[0] : 0.0f),
+                     region_->position + (positionMod ? positionMod[0] : 0.0f),
+                     1.9952623149688797f, m);
+        float* l = leftBuffer.data();
+        float* r = rightBuffer.data();
+        for (size_t i = 0; i < numSamples; ++i) {
+            const float x = l[i], y = r[i];
+            l[i] = m[0] * x + m[1] * y;
+            r[i] = m[2] * x + m[3] * y;
+        }
+        return;
+    }
+
     // Apply panning
     fill(*modulationSpan, region_->pan);
-    if (float* mod = mm.getModulation(panTarget_)) {
+    if (panMod) {
         for (size_t i = 0; i < numSamples; ++i)
-            (*modulationSpan)[i] += mod[i];
+            (*modulationSpan)[i] += panMod[i];
     }
     pan(*modulationSpan, leftBuffer, rightBuffer);
 
@@ -1162,8 +1192,16 @@ void Voice::Impl::fillWithData(AudioSpan<float> buffer) noexcept
         pitchEnvelope(pitch);
 
         float baseRatio = pitchRatio_ * speedRatio_;
-        for (size_t i = 0; i < numSamples; ++i)
-            (*jumps)[i] = baseRatio * centsFactor(pitch[i]);
+        // A pitch steady over the block (a pipe without tremulant) takes one pow, not one
+        // per sample: the same value, so the same jumps bit for bit.
+        bool steady = true;
+        for (size_t i = 1; i < numSamples && steady; ++i)
+            steady = pitch[i] == pitch[0];
+        if (steady)
+            fill<float>(*jumps, baseRatio * centsFactor(pitch[0]));
+        else
+            for (size_t i = 0; i < numSamples; ++i)
+                (*jumps)[i] = baseRatio * centsFactor(pitch[i]);
 
         // Take the first sample if the voice just started
         if (age_ == 0)

@@ -16,7 +16,11 @@ using TimePoint = std::chrono::time_point<std::chrono::high_resolution_clock>;
 
 static TimePoint highResNow()
 {
-#ifdef EMSCRIPTEN
+#if defined(EMSCRIPTEN) || defined(SFIZZ_NO_TIMING)
+    // SFIZZ_NO_TIMING: no clock reads for the callback breakdown (all durations read 0).
+    // Voice::renderBlock times four stages per voice per block, eight clock reads, and
+    // where clock_gettime is a system call (the Samsung M31) that was about a third of
+    // the audio thread under a full registration.
     return {};
 #else
     return std::chrono::high_resolution_clock::now();

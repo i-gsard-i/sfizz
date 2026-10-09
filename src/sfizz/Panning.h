@@ -47,4 +47,13 @@ inline void width(absl::Span<const float> widthEnvelope, absl::Span<float> leftB
     width(widthEnvelope.data(), leftBuffer.data(), rightBuffer.data(), minSpanSize(widthEnvelope, leftBuffer, rightBuffer));
 }
 
+/**
+ * @brief A stereo voice's pan, width and position stages for values constant over a block,
+ * and a gain, folded into one matrix: L' = m[0] L + m[1] R, R' = m[2] L + m[3] R.
+ * It takes the table entries pan() and width() take on their vector path, so it gives
+ * their result up to float rounding, for one multiply-add pair per frame instead of three
+ * table passes and two gain passes.
+ */
+void stereoMatrix(float pan, float width, float position, float gain, float m[4]) noexcept;
+
 }

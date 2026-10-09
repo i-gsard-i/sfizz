@@ -98,6 +98,27 @@ void pan(const float* panEnvelope, float* leftBuffer, float* rightBuffer, unsign
 
 }
 
+// The table index pan() and width() use on their vector path for a value in [-1, 1]:
+// vcvtq_u32_f32 truncates and saturates negatives at 0, then the clamp to panSize - 1.
+static unsigned panIndex(float x) noexcept
+{
+    const float f = (x + 1.0f) * (0.5f * panSize) + 0.5f;
+    const unsigned i = f > 0.0f ? static_cast<unsigned>(f) : 0u;
+    return i < static_cast<unsigned>(panSize - 1) ? i : static_cast<unsigned>(panSize - 1);
+}
+
+void stereoMatrix(float pan, float width, float position, float gain, float m[4]) noexcept
+{
+    const unsigned ip = panIndex(pan), iw = panIndex(width), iq = panIndex(position);
+    const float pl = panData[ip], pr = panData[panSize - ip - 1];      // pan
+    const float c1 = panData[iw], c2 = panData[panSize - iw - 1];      // width
+    const float ql = panData[iq], qr = panData[panSize - iq - 1];      // position
+    m[0] = gain * ql * c2 * pl;
+    m[1] = gain * ql * c1 * pr;
+    m[2] = gain * qr * c1 * pl;
+    m[3] = gain * qr * c2 * pr;
+}
+
 inline void tickWidth(const float* width, float* leftBuffer, float* rightBuffer)
 {
     float w = (*width + 1.0f) * 0.5f;
