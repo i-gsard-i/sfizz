@@ -158,6 +158,7 @@ public:
     struct CompositeLink {
         bool valid { false };
         Layer* tail { nullptr };
+        Layer* staccato { nullptr };   // the staccato tail beside it, if any
         std::vector<Layer*> members;
         uint64_t memberCcs[2] {};   // one bit per member's stop gate CC
         mutable float fullLevel { -1.0f };  // sqrt(sum of (amplitude * volume * loop rms)^2), lazily

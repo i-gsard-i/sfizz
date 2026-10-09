@@ -210,15 +210,17 @@ bool sfz::Region::parseOpcode(const Opcode& rawOpcode, bool cleanOpcode)
             compositeTh = frames;
         break;
     }
-    case hash("composite_tailscale"): {
-        compositeTailScale.clear();
+    case hash("composite_tailscale"):
+    case hash("composite_staccatoscale"): {
+        auto& table = opcode.lettersOnlyHash == hash("composite_tailscale") ? compositeTailScale : compositeStaccatoScale;
+        table.clear();
         for (absl::string_view v : absl::StrSplit(opcode.value, ',')) {
             float x {};
             if (!absl::SimpleAtof(trim(v), &x)) {
-                compositeTailScale.clear();
+                table.clear();
                 break;
             }
-            compositeTailScale.push_back(x);
+            table.push_back(x);
         }
         break;
     }
@@ -232,6 +234,7 @@ bool sfz::Region::parseOpcode(const Opcode& rawOpcode, bool cleanOpcode)
         break;
     }
     case hash("composite_tail"):
+    case hash("composite_staccato"):
     case hash("composite_member"): {
         const auto trimmed = trim(opcode.value);
         if (trimmed.empty())
@@ -239,6 +242,8 @@ bool sfz::Region::parseOpcode(const Opcode& rawOpcode, bool cleanOpcode)
         std::string filename = absl::StrCat(defaultPath, absl::StrReplaceAll(trimmed, { { "\\", "/" } }));
         if (opcode.lettersOnlyHash == hash("composite_tail"))
             compositeTail = std::move(filename);
+        else if (opcode.lettersOnlyHash == hash("composite_staccato"))
+            compositeStaccato = std::move(filename);
         else
             compositeMembers.push_back(std::move(filename));
         break;

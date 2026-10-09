@@ -297,6 +297,13 @@ struct Region {
     // one past the end. Measured by the renderer on each member's own render, as each
     // pipe's tail scale would have been, and added by their tails' power.
     std::vector<float> compositeTailScale; // composite_tailscale
+    // A second summed tail started beside it (`composite_staccato`, a sample path): the
+    // members at the levels they have at one early age, for a note released before the
+    // slower ones have spoken; and its own scale by the note's age (`composite_staccatoscale`).
+    // The renderer fits the two tables together, so the pair comes nearest to each member's
+    // tail at its own scale (organdroid docs/design/COMPOSITE_STOPS_DESIGN.md §4d).
+    std::string compositeStaccato; // composite_staccato
+    std::vector<float> compositeStaccatoScale; // composite_staccatoscale
 
     // Region logic: key mapping
     UncheckedRange<uint8_t> keyRange { Default::loKey, Default::hiKey }; //lokey, hikey and key

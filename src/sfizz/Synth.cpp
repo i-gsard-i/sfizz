@@ -1568,6 +1568,12 @@ void Synth::Impl::resolveComposites() noexcept
             if (ok)
                 link.tail = it->second;
         }
+        if (ok && !region.compositeStaccato.empty()) {
+            const auto it = tails.find(region.compositeStaccato);
+            ok = it != tails.end();
+            if (ok)
+                link.staccato = it->second;
+        }
         for (size_t i = 0; ok && i < region.compositeMembers.size(); ++i) {
             // The member: a region of that file on the composite's manual, the one whose
             // keys hold the composite's key if there are several (a sample shared by keys).
@@ -1610,6 +1616,7 @@ void Synth::Impl::resolveComposites() noexcept
                 << "its tail or a member is missing, or a member has no stop_cc");
             link.members.clear();
             link.tail = nullptr;
+            link.staccato = nullptr;
             link.memberCcs[0] = link.memberCcs[1] = 0;
         }
     }
@@ -1684,18 +1691,30 @@ void Synth::Impl::startCompositeTail(Voice& composite, Layer* tail, int delay, f
     if (layer == nullptr)
         return;
 
+    startCompositeTailVoice(composite, tail, layer->getRegion().compositeTailScale, delay, velocity);
+    // The staccato tail (Region::compositeStaccato), under its tail region's own conditions.
+    Layer* staccato = layer->composite_.staccato;
+    if (staccato && staccato->registerNoteOff(composite.getTriggerEvent().number, velocity,
+                                              randNoteDistribution_(Random::randomGenerator)))
+        startCompositeTailVoice(composite, staccato, layer->getRegion().compositeStaccatoScale, delay, velocity);
+}
+
+void Synth::Impl::startCompositeTailVoice(Voice& composite, Layer* tail, const std::vector<float>& table, int delay, float velocity) noexcept
+{
     // The tail scale, as each pipe's tail gets it (startVoice, release alignment): the
-    // note's current level against its full level. Each member would have had its own; the
-    // renderer measured them on each member's render and added them by their tails' power,
-    // one value per power-follower step of the note's age (Region::compositeTailScale). The
-    // composite's own power cannot stand for them: members at different stages of their
-    // speech give one sum, and its volume= holds the file's storage gain.
+    // note's current level against its full level, one value per power-follower step of
+    // the note's age. Each member would have had its own; the renderer measured them on
+    // each member's render and fitted this tail's table (and the staccato tail's) to them
+    // (Region::compositeTailScale). The composite's own power cannot stand for them:
+    // members at different stages of their speech give one sum, and its volume= holds the
+    // file's storage gain. A tail at zero is not started.
     float scale = 1.0f;
-    const auto& table = layer->getRegion().compositeTailScale;
     if (!table.empty()) {
         const size_t k = static_cast<size_t>(std::max(composite.getAge(), 0)) / config::powerFollowerStep;
         scale = table[std::min(k, table.size() - 1)];
         scale = scale < 0.0f ? 0.0f : (scale > 1.0f ? 1.0f : scale);
+        if (scale <= 0.0f)
+            return;
     }
 
     const Region& region = tail->getRegion();

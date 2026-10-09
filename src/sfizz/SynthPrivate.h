@@ -184,9 +184,11 @@ struct Synth::Impl final: public Parser::Listener {
 
     /**
      * @brief Start the summed tail of a composite voice released by a note-off, scaled to
-     * the note's level and faded in with the equal-power half of the crossfade.
+     * the note's level and faded in with the equal-power half of the crossfade; and its
+     * staccato tail beside it, if it has one, scaled by its own table.
      */
     void startCompositeTail(Voice& composite, Layer* tail, int delay, float velocity) noexcept;
+    void startCompositeTailVoice(Voice& composite, Layer* tail, const std::vector<float>& table, int delay, float velocity) noexcept;
 
     /**
      * @brief Start all delayed sustain release voices of the region if necessary
