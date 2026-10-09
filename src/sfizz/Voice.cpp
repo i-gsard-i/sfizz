@@ -846,6 +846,22 @@ void Voice::renderBlock(AudioSpan<float, 2> buffer) noexcept
     if (impl.state_ == State::cleanMeUp)
         return;
 
+    // "Cut release tails" (ReleaseAlign.h): a release voice, recorded or composite, fades
+    // out linearly over its last `fade` seconds so it is silent `cut` seconds after it
+    // starts. Checked per block; a voice already releasing (retired, offed) keeps its fade.
+    if (region->trigger == Trigger::release && !region->flexAmpEG
+        && impl.state_ == State::playing && !impl.egAmplitude_.isReleased()) {
+        const float cut = sfz::releaseTailCut();
+        if (cut > 0.0f) {
+            const float fade = min(config::releaseTailCutFade, 0.5f * cut);
+            if (impl.age_ >= static_cast<int>((cut - fade) * impl.sampleRate_)) {
+                impl.egAmplitude_.setLinearReleaseTime(fade);
+                impl.egAmplitude_.stopDynamicUpdates();
+                impl.release(0);
+            }
+        }
+    }
+
     const auto delay = min(static_cast<size_t>(impl.initialDelay_), buffer.getNumFrames());
     auto delayed_buffer = buffer.subspan(delay);
     impl.initialDelay_ -= static_cast<int>(delay);

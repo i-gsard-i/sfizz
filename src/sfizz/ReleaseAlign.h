@@ -49,6 +49,10 @@ void sfizz_release_align_set_crossfade(float seconds);
 // lowest C of each rank): they get a plain exponential fade of this length instead of being
 // cut at the crossfade window. Set to ~the typical recorded-tail length (align.py).
 void sfizz_release_align_set_fallback(float seconds);
+// "Cut release tails" (organdroid, docs/tests/VOICE_POLYPHONY_REPORT.md): every
+// trigger=release voice is faded out so it is silent `seconds` after it starts. 0 = the
+// recorded tails play whole (default). Live: read by each release voice as it renders.
+void sfizz_release_tail_cut(float seconds);
 }
 
 namespace sfz {
@@ -67,6 +71,9 @@ float releaseAlignCrossfade() noexcept;
 
 // Fallback fade time in seconds for no-tail pipes (see setter above).
 float releaseAlignFallback() noexcept;
+
+// Release-tail cut in seconds, 0 = none (see setter above).
+float releaseTailCut() noexcept;
 
 // On hit, fills period/anchor (source frames) + loopRms and returns true. track/trackSize
 // get the entry's phase track (nullptr/0 if it has none); valid until the next clear.

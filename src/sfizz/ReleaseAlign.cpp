@@ -18,6 +18,7 @@ struct Registry {
     std::atomic<bool> enabled { false };
     std::atomic<float> crossfade { 0.025f };
     std::atomic<float> fallback { 1.4f };   // no-tail fade (~typical recorded-tail length)
+    std::atomic<float> tailCut { 0.0f };    // 0 = recorded tails play whole
 };
 
 // Function-local static avoids static-init-order issues; constructed on first use,
@@ -62,6 +63,11 @@ float releaseAlignCrossfade() noexcept
 float releaseAlignFallback() noexcept
 {
     return reg().fallback.load(std::memory_order_relaxed);
+}
+
+float releaseTailCut() noexcept
+{
+    return reg().tailCut.load(std::memory_order_relaxed);
 }
 
 bool releaseAlignLookup(const std::string& attackSample, float& period, int& anchor, float& loopRms,
@@ -153,6 +159,11 @@ void sfizz_release_align_set_fallback(float seconds)
 {
     if (seconds > 0.0f)
         reg().fallback.store(seconds, std::memory_order_relaxed);
+}
+
+void sfizz_release_tail_cut(float seconds)
+{
+    reg().tailCut.store(seconds > 0.0f ? seconds : 0.0f, std::memory_order_relaxed);
 }
 
 } // extern "C"

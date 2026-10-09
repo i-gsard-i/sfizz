@@ -292,6 +292,7 @@ std::string sfz::Sfizz::describeActiveVoices() const
         if (v->getCompositeLayer() != nullptr) out += " composite";
         if (r->isRelease()) out += " release";
         if (v->isNoteOff()) out += " off";
+        if (v->offedOrFree()) out += " stolen";   // offed by polyphony/off_by, fast fade
         out += '\n';
     }
     return out;

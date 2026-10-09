@@ -35,7 +35,13 @@ namespace config {
     constexpr int numBackgroundThreads { 4 };
     constexpr unsigned fileClearingPeriod { 5 }; // in seconds
     constexpr int numVoices { 64 };
-    constexpr unsigned maxVoices { 256 };
+    // organdroid: the compile-time ceiling only. The app sets the real polyphony at palette
+    // load (setNumVoices); a tutti with couplers and release tails outgrew 256, and the
+    // stealer then cut the oldest HELD note (VOICE_POLYPHONY report).
+    constexpr unsigned maxVoices { 10240 };
+    // organdroid: the fade at the end of a cut release tail (ReleaseAlign.h, "Cut release
+    // tails"), at most half the cut. GrandOrgue fades its shortened tails over 370 ms.
+    constexpr float releaseTailCutFade { 0.3f };
     constexpr unsigned smoothingSteps { 512 };
     constexpr uint16_t xfadeSmoothing { 5 };
     constexpr uint16_t gainSmoothing { 0 };
