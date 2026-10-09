@@ -222,6 +222,15 @@ bool sfz::Region::parseOpcode(const Opcode& rawOpcode, bool cleanOpcode)
         }
         break;
     }
+    case hash("composite_stops"): {
+        compositeStops[0] = compositeStops[1] = 0;
+        for (absl::string_view v : absl::StrSplit(opcode.value, ',')) {
+            int cc {};
+            if (absl::SimpleAtoi(trim(v), &cc) && cc >= 0 && cc < 128)
+                compositeStops[cc >> 6] |= uint64_t { 1 } << (cc & 63);
+        }
+        break;
+    }
     case hash("composite_tail"):
     case hash("composite_member"): {
         const auto trimmed = trim(opcode.value);

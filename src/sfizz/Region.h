@@ -288,6 +288,10 @@ struct Region {
     int compositeTh { 0 }; // composite_th
     std::string compositeTail; // composite_tail
     std::vector<std::string> compositeMembers; // composite_member
+    // The members' gate CCs in this palette (`composite_stops`, comma-separated), set by
+    // the app when it appends the composite: two stops can play the same file on the same
+    // manual (a borrowed rank), and only the CC tells which one is the member. Empty = any.
+    uint64_t compositeStops[2] { 0, 0 }; // composite_stops
     // The summed tail's scale by the note's age at the note-off (`composite_tailscale`,
     // comma-separated): entry k holds after k power-follower steps of 512 frames, the last
     // one past the end. Measured by the renderer on each member's own render, as each

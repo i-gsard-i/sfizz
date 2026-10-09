@@ -1478,7 +1478,11 @@ Voice* Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& trig
 
 void Synth::Impl::resolveComposites() noexcept
 {
-    absl::flat_hash_map<std::string, Layer*> attacks;
+    // Every attack region of each file: the same file can be in the palette more than once
+    // (one stop loaded on two manuals), and a member must be the one on the composite's
+    // own manual, or its pipes are not the ones kept silent (and the handover starts the
+    // other manual's copy): those pipes would sound twice.
+    absl::flat_hash_map<std::string, std::vector<Layer*>> attacks;
     absl::flat_hash_map<std::string, Layer*> tails;
     bool any = false;
     for (const LayerPtr& layerPtr : layers_) {
@@ -1492,7 +1496,7 @@ void Synth::Impl::resolveComposites() noexcept
             if (region.isRelease())
                 tails.emplace(name, layerPtr.get());
         } else if (!region.isRelease()) {
-            attacks.emplace(name, layerPtr.get());
+            attacks[name].push_back(layerPtr.get());
         }
     }
     if (!any)
@@ -1512,13 +1516,37 @@ void Synth::Impl::resolveComposites() noexcept
                 link.tail = it->second;
         }
         for (size_t i = 0; ok && i < region.compositeMembers.size(); ++i) {
+            // The member: a region of that file on the composite's manual, the one whose
+            // keys hold the composite's key if there are several (a sample shared by keys).
+            // It must carry its stop's gate CC: that is how its own pipes are kept silent
+            // while the composite plays them.
+            // With `composite_stops`, it must also be one of those stops: a borrowed rank
+            // plays the same file under two stops of one manual.
+            Layer* member = nullptr;
             const auto it = attacks.find(region.compositeMembers[i]);
-            // A member must carry its stop's gate CC: that is how its own pipes are kept
-            // silent while the composite plays them.
-            ok = it != attacks.end() && it->second->getRegion().gateCc >= 0;
+            const bool byCc = (region.compositeStops[0] | region.compositeStops[1]) != 0;
+            if (it != attacks.end()) {
+                const uint8_t key = region.keyRange.getStart();
+                for (Layer* cand : it->second) {
+                    const Region& r = cand->getRegion();
+                    if ((r.divMask & region.divMask) == 0 || r.gateCc < 0 || r.gateCc >= 128)
+                        continue;
+                    if (byCc && !((region.compositeStops[r.gateCc >> 6] >> (r.gateCc & 63)) & 1u))
+                        continue;
+                    // One file twice in the list is two stops sharing a pipe (a borrowed
+                    // bass): each entry is a different stop's region.
+                    if (std::find(link.members.begin(), link.members.end(), cand) != link.members.end())
+                        continue;
+                    if (member == nullptr || r.keyRange.containsWithEnd(key))
+                        member = cand;
+                    if (r.keyRange.containsWithEnd(key))
+                        break;
+                }
+            }
+            ok = member != nullptr;
             if (ok) {
-                const int cc = it->second->getRegion().gateCc;
-                link.members.push_back(it->second);
+                const int cc = member->getRegion().gateCc;
+                link.members.push_back(member);
                 link.memberLevels.reserve(region.compositeMembers.size());
                 link.memberCcs[cc >> 6] |= uint64_t { 1 } << (cc & 63);
             }

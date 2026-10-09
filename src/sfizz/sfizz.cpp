@@ -5,6 +5,8 @@
 // If not, contact the sfizz maintainers at https://github.com/sfztools/sfizz
 
 #include "Synth.h"
+#include "Voice.h"
+#include "Region.h"
 #include "Messaging.h"
 #include "sfizz.hpp"
 #include "sfizz_private.hpp"
@@ -274,6 +276,25 @@ void sfz::Sfizz::renderBlock(float** buffers, size_t numSamples, int numOutputs)
 int sfz::Sfizz::getNumActiveVoices() const noexcept
 {
     return synth->synth.getNumActiveVoices();
+}
+
+std::string sfz::Sfizz::describeActiveVoices() const
+{
+    std::string out;
+    for (const sfz::Voice* v : synth->synth.getActiveVoices()) {
+        const sfz::Region* r = v->getRegion();
+        if (r == nullptr)
+            continue;
+        out += std::string(r->sampleId->filename());
+        out += " cc=" + std::to_string(r->gateCc);
+        out += " key=" + std::to_string(v->getTriggerEvent().number);
+        out += " age=" + std::to_string(v->getAge());
+        if (v->getCompositeLayer() != nullptr) out += " composite";
+        if (r->isRelease()) out += " release";
+        if (v->isNoteOff()) out += " off";
+        out += '\n';
+    }
+    return out;
 }
 
 int sfz::Sfizz::getNumVoices() const noexcept

@@ -779,6 +779,12 @@ public:
     int getNumActiveVoices() const noexcept;
 
     /**
+     * @brief Debug: one line per sounding voice (sample file, stop_cc, age in frames,
+     *        "composite" for a composite voice, "off" once its note is off). Not RT-safe.
+     */
+    std::string describeActiveVoices() const;
+
+    /**
      * @brief Return the total number of voices in the synth (the polyphony).
      * @since 0.2.0
      */
