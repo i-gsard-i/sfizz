@@ -79,10 +79,12 @@ Voice* VoiceManager::findAttackVoice(const Region* releaseRegion, uint32_t divMa
         );
     };
 
+    // Sounding voices only, in pool order: ties in age resolve as the full walk did.
     Voice* found = nullptr;
-    for (Voice& v : list_)
+    forEachActive([&](Voice& v) {
         if (compatibleVoice(v) && (found == nullptr || v.getAge() < found->getAge()))
             found = &v;
+    });
     return found;
 }
 
@@ -193,6 +195,8 @@ void VoiceManager::requireNumVoices(int numVoices, Resources& resources)
     list_.reserve(numEffectiveVoices);
     temp_.reserve(numEffectiveVoices);
     activeVoices_.reserve(numEffectiveVoices);
+    for (auto& snap : snapshots_)
+        snap.reserve(numEffectiveVoices);
 
     for (int i = 0; i < numEffectiveVoices; ++i) {
         list_.emplace_back(i, resources);

@@ -13,6 +13,9 @@
 #include "Resources.h"
 #include "Voice.h"
 #include "VoiceStealing.h"
+#include <algorithm>
+#include <array>
+#include <functional>
 #include <vector>
 
 namespace sfz {
@@ -210,7 +213,36 @@ private:
      */
     void checkEnginePolyphony(int delay) noexcept;
 
+    // organdroid: buffers for forEachActive, one per nesting level.
+    std::array<std::vector<Voice*>, 4> snapshots_;
+    unsigned snapshotDepth_ { 0 };
+
 public:
+    /**
+     * @brief organdroid: call f(voice) for every voice that is not idle, in pool order.
+     * Walking the whole pool touches each voice's Impl, one cache miss per voice even when
+     * idle: with the pool sized for a big Disposition (thousands of voices) that dominated
+     * the render. The sounding voices are walked from a snapshot sorted by address (= pool
+     * order, list_ is contiguous), so the mix sums in the same order as before and the body
+     * may start or end voices. Bodies must still skip a voice found idle, as they did.
+     */
+    template <class F>
+    void forEachActive(F&& f)
+    {
+        if (snapshotDepth_ >= snapshots_.size()) {
+            for (Voice& v : list_)
+                if (!v.isFree())
+                    f(v);
+            return;
+        }
+        std::vector<Voice*>& snap = snapshots_[snapshotDepth_++];
+        snap.assign(activeVoices_.begin(), activeVoices_.end());   // reserved: no allocation
+        std::sort(snap.begin(), snap.end(), std::less<Voice*>());
+        for (Voice* v : snap)
+            f(*v);
+        --snapshotDepth_;
+    }
+
     // Vector shortcuts
     typename decltype(list_)::iterator begin() { return list_.begin(); }
     typename decltype(list_)::const_iterator cbegin() const { return list_.cbegin(); }

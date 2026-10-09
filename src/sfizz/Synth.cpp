@@ -1158,12 +1158,12 @@ void Synth::renderBlock(AudioSpan<float> buffer) noexcept
     // Composite stops (Composite.h): a composite voice that would play past its handover
     // time in this block hands over to its member pipes before the block, so the members
     // take over at a block boundary, as live note events start.
-    for (auto& voice : impl.voiceManager_) {
+    impl.voiceManager_.forEachActive([&](Voice& voice) {
         const Layer* layer = voice.getCompositeLayer();
         if (layer != nullptr && !voice.isFree()
             && voice.getAge() + static_cast<int>(numFrames) > layer->getRegion().compositeTh)
             impl.handOverComposite(voice);
-    }
+    });
 
     ModMatrix& mm = impl.resources_.getModMatrix();
     mm.beginCycle(numFrames);
@@ -1192,9 +1192,10 @@ void Synth::renderBlock(AudioSpan<float> buffer) noexcept
     { // Main render block
         ScopedTiming logger { callbackBreakdown.renderMethod, ScopedTiming::Operation::addToDuration };
 
-        for (auto& voice : impl.voiceManager_) {
+        // organdroid: the sounding voices only, in pool order (VoiceManager::forEachActive).
+        impl.voiceManager_.forEachActive([&](Voice& voice) {
             if (voice.isFree())
-                continue;
+                return;
 
             mm.beginVoice(voice.getId(), voice.getRegion()->getId(), voice.getTriggerEvent().value);
 
@@ -1218,7 +1219,7 @@ void Synth::renderBlock(AudioSpan<float> buffer) noexcept
 
             if (voice.toBeCleanedUp())
                 voice.reset();
-        }
+        });
     }
 
     { // Apply effect buses
@@ -1358,9 +1359,9 @@ void Synth::hdNoteOff(int delay, int noteNumber, float normalizedVelocity) noexc
     size_t numCompositeTails = 0;
     impl.dispatchSuppressCc_[0] = impl.dispatchSuppressCc_[1] = 0;
     if (impl.dispatchStopCc_ < 0) {
-        for (auto& voice : impl.voiceManager_) {
+        impl.voiceManager_.forEachActive([&](Voice& voice) {
             if (!isCompositeOnNote(voice) || voice.isNoteOff())
-                continue;
+                return;
             const Layer::CompositeLink& link = voice.getCompositeLayer()->composite_;
             impl.dispatchSuppressCc_[0] |= link.memberCcs[0];
             impl.dispatchSuppressCc_[1] |= link.memberCcs[1];
@@ -1371,13 +1372,14 @@ void Synth::hdNoteOff(int delay, int noteNumber, float normalizedVelocity) noexc
                 voice.prepareCompositeRelease(sfz::releaseAlignCrossfade());
                 compositeTails[numCompositeTails++] = { &voice, tail };
             }
-        }
+        });
     }
 
-    for (auto& voice : impl.voiceManager_)
+    impl.voiceManager_.forEachActive([&](Voice& voice) {
         if ((voice.getDivisionMask() & impl.dispatchDivMask_) != 0
             && (impl.dispatchStopCc_ < 0 || voice.getGateCc() == impl.dispatchStopCc_))
             voice.registerNoteOff(delay, noteNumber, replacedVelocity);
+    });
 
     for (size_t i = 0; i < numCompositeTails; ++i)
         impl.startCompositeTail(*compositeTails[i].first, compositeTails[i].second, delay, replacedVelocity);
@@ -1668,13 +1670,13 @@ void Synth::Impl::startCompositeTail(Voice& composite, Layer* tail, int delay, f
 
 void Synth::Impl::checkOffGroups(const Region* region, int delay, int number, bool chokedByCC)
 {
-    for (auto& voice : voiceManager_) {
+    voiceManager_.forEachActive([&](Voice& voice) {
         if (voice.checkOffGroup(region, delay, number)) {
             const TriggerEvent& event = voice.getTriggerEvent();
             if (event.type == TriggerEventType::NoteOn && !chokedByCC)
                 noteOffDispatch(delay, event.number, event.value);
         }
-    }
+    });
 }
 
 void Synth::Impl::noteOffDispatch(int delay, int noteNumber, float velocity) noexcept
@@ -1894,8 +1896,7 @@ void Synth::Impl::performHdcc(int delay, int ccNumber, float normValue, bool asM
         }
     }
 
-    for (auto& voice : voiceManager_)
-        voice.registerCC(delay, ccNumber, normValue);
+    voiceManager_.forEachActive([&](Voice& voice) { voice.registerCC(delay, ccNumber, normValue); });
 
     ccDispatch(delay, ccNumber, normValue, extendedArg);
     midiState.ccEvent(delay, ccNumber, normValue);
@@ -1941,9 +1942,7 @@ void Synth::hdPitchWheel(int delay, float normalizedPitch) noexcept
         layer->registerPitchWheel(normalizedPitch);
     }
 
-    for (auto& voice : impl.voiceManager_) {
-        voice.registerPitchWheel(delay, normalizedPitch);
-    }
+    impl.voiceManager_.forEachActive([&](Voice& voice) { voice.registerPitchWheel(delay, normalizedPitch); });
 
     impl.performHdcc(delay, ExtendedCCs::pitchBend, normalizedPitch, false);
 }
@@ -1974,9 +1973,7 @@ void Synth::hdChannelAftertouch(int delay, float normAftertouch) noexcept
         layerPtr->registerAftertouch(normAftertouch);
     }
 
-    for (auto& voice : impl.voiceManager_) {
-        voice.registerAftertouch(delay, normAftertouch);
-    }
+    impl.voiceManager_.forEachActive([&](Voice& voice) { voice.registerAftertouch(delay, normAftertouch); });
 
     impl.performHdcc(delay, ExtendedCCs::channelAftertouch, normAftertouch, false);
 }
@@ -1994,8 +1991,7 @@ void Synth::hdPolyAftertouch(int delay, int noteNumber, float normAftertouch) no
 
     impl.resources_.getMidiState().polyAftertouchEvent(delay, noteNumber, normAftertouch);
 
-    for (auto& voice : impl.voiceManager_)
-        voice.registerPolyAftertouch(delay, noteNumber, normAftertouch);
+    impl.voiceManager_.forEachActive([&](Voice& voice) { voice.registerPolyAftertouch(delay, noteNumber, normAftertouch); });
 
     impl.performHdcc(delay, ExtendedCCs::polyphonicAftertouch, normAftertouch, false, noteNumber);
 }

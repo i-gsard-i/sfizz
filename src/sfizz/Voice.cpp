@@ -252,6 +252,7 @@ struct Voice::Impl
     float pitchRatio_ { 1.0 };
     float baseVolumedB_ { 0.0 };
     float baseGain_ { 1.0 };
+    float stereoGain_ { 1.0 }; // a constant block gain ampStageStereo left for panStageStereo
     float baseFrequency_ { 440.0 };
     uint8_t pitchKeycenter_ { Default::key };
 
@@ -1003,6 +1004,7 @@ void Voice::Impl::ampStageMono(AudioSpan<float> buffer) noexcept
 void Voice::Impl::ampStageStereo(AudioSpan<float> buffer) noexcept
 {
     ScopedTiming logger { amplitudeDuration_ };
+    stereoGain_ = 1.0f;
 
     BufferPool& bufferPool = resources_.getBufferPool();
 
@@ -1012,7 +1014,21 @@ void Voice::Impl::ampStageStereo(AudioSpan<float> buffer) noexcept
         return;
 
     amplitudeEnvelope(*modulationSpan);
-    applyCrossfades(*modulationSpan);
+    // No xfin/xfout CCs: the crossfade factor is 1 throughout (its smoother is reset to 1
+    // and stays there), so the stage would only multiply by 1.
+    if (!region_->crossfadeCCInRange.empty() || !region_->crossfadeCCOutRange.empty())
+        applyCrossfades(*modulationSpan);
+
+    // A gain constant over the block (a held pipe on its sustain) is left for
+    // panStageStereo to fold into its matrix, saving a pass over both channels.
+    const absl::Span<const float> gain = *modulationSpan;
+    bool constant = numSamples > 0;
+    for (size_t i = 1; i < numSamples && constant; ++i)
+        constant = gain[i] == gain[0];
+    if (constant) {
+        stereoGain_ = gain[0];
+        return;
+    }
     buffer.applyGain(*modulationSpan);
 }
 
@@ -1055,17 +1071,11 @@ void Voice::Impl::panStageStereo(AudioSpan<float> buffer) noexcept
     const auto leftBuffer = buffer.getSpan(0);
     const auto rightBuffer = buffer.getSpan(1);
 
-    BufferPool& bufferPool = resources_.getBufferPool();
-
-    auto modulationSpan = bufferPool.getBuffer(numSamples);
-    if (!modulationSpan)
-        return;
-
     ModMatrix& mm = resources_.getModMatrix();
 
     // Pan, width and position unchanging over the block (an organ pipe's case, and the
-    // spread knob's between moves): the stages below and their +6 dB as one matrix,
-    // from the same table entries (Panning.h, stereoMatrix).
+    // spread knob's between moves): the stages below, their +6 dB and the amp stage's
+    // constant gain as one matrix, from the same table entries (Panning.h, stereoMatrix).
     const float* panMod = mm.getModulation(panTarget_);
     const float* widthMod = mm.getModulation(widthTarget_);
     const float* positionMod = mm.getModulation(positionTarget_);
@@ -1082,7 +1092,7 @@ void Voice::Impl::panStageStereo(AudioSpan<float> buffer) noexcept
         stereoMatrix(region_->pan + (panMod ? panMod[0] : 0.0f),
                      region_->width + (widthMod ? widthMod[0] : 0.0f),
                      region_->position + (positionMod ? positionMod[0] : 0.0f),
-                     1.9952623149688797f, m);
+                     1.9952623149688797f * stereoGain_, m);
         float* l = leftBuffer.data();
         float* r = rightBuffer.data();
         for (size_t i = 0; i < numSamples; ++i) {
@@ -1092,6 +1102,16 @@ void Voice::Impl::panStageStereo(AudioSpan<float> buffer) noexcept
         }
         return;
     }
+
+    if (stereoGain_ != 1.0f) {
+        applyGain1(stereoGain_, leftBuffer);
+        applyGain1(stereoGain_, rightBuffer);
+    }
+
+    BufferPool& bufferPool = resources_.getBufferPool();
+    auto modulationSpan = bufferPool.getBuffer(numSamples);
+    if (!modulationSpan)
+        return;
 
     // Apply panning
     fill(*modulationSpan, region_->pan);
@@ -1183,6 +1203,7 @@ void Voice::Impl::fillWithData(AudioSpan<float> buffer) noexcept
     auto indices = bufferPool.getIndexBuffer(numSamples);
     if (!indices || !coeffs)
         return;
+    bool unityRatio = false; // whole frames, one per output frame (see the copy below)
     {
         auto jumps = bufferPool.getBuffer(numSamples);
         if (!jumps)
@@ -1197,9 +1218,11 @@ void Voice::Impl::fillWithData(AudioSpan<float> buffer) noexcept
         bool steady = true;
         for (size_t i = 1; i < numSamples && steady; ++i)
             steady = pitch[i] == pitch[0];
-        if (steady)
-            fill<float>(*jumps, baseRatio * centsFactor(pitch[0]));
-        else
+        if (steady) {
+            const float ratio = baseRatio * centsFactor(pitch[0]);
+            fill<float>(*jumps, ratio);
+            unityRatio = ratio == 1.0f && floatPositionOffset_ == 0.0f;
+        } else
             for (size_t i = 0; i < numSamples; ++i)
                 (*jumps)[i] = baseRatio * centsFactor(pitch[i]);
 
@@ -1349,8 +1372,23 @@ void Voice::Impl::fillWithData(AudioSpan<float> buffer) noexcept
         absl::Span<const int> ptIndices = indices->subspan(ptStart, ptSize);
         absl::Span<const float> ptCoeffs = coeffs->subspan(ptStart, ptSize);
 
-        fillInterpolatedWithQuality<false>(
-            source, ptBuffer, ptIndices, ptCoeffs, {}, quality);
+        // A pipe played at its own pitch (playback ratio exactly 1, no fraction carried in)
+        // reads whole frames: every coeff is 0 and the indices step by one within a
+        // partition (loop wraps start a new one). The nearest, linear and Hermite weights
+        // at 0 are exactly (0, 1, 0, 0), so a copy gives the interpolator's output bit for
+        // bit (up to the sign of a zero) for none of its work. The one break is the clamp
+        // at the end of a one-shot, which rewrites the tail of the block: the last frame
+        // shows it.
+        const bool wholeFrames = unityRatio && quality <= 2 && ptSize > 0
+            && ptCoeffs[ptSize - 1] == 0.0f && ptIndices[ptSize - 1] == ptIndices[0] + int(ptSize - 1);
+        if (wholeFrames) {
+            for (size_t c = 0; c < source.getNumChannels(); ++c) {   // a mono source fills left only, as the interpolator does
+                const float* from = source.getConstSpan(c).data() + ptIndices[0];
+                std::copy(from, from + ptSize, ptBuffer.getSpan(c).data());
+            }
+        } else
+            fillInterpolatedWithQuality<false>(
+                source, ptBuffer, ptIndices, ptCoeffs, {}, quality);
 
         if (ptType == kPartitionLoopXfade) {
             auto xfTemp1 = bufferPool.getBuffer(numSamples);

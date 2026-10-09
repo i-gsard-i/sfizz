@@ -162,11 +162,14 @@ void ADSREnvelope::getBlockInternal(absl::Span<Float> output) noexcept
                 shouldRelease = true;
                 break;
             }
-            while (count < size) {
-                if (currentValue > sustain)
-                    currentValue += transitionDelta;
+            while (count < size && currentValue > sustain) {
+                currentValue += transitionDelta;
                 output[count++] = currentValue;
             }
+            // Settled on the sustain level (a held pipe): the rest of the segment is one
+            // value, the same samples the per-sample loop wrote, as one vectorized fill.
+            std::fill(output.begin() + count, output.begin() + size, currentValue);
+            count = size;
             break;
         case State::Release:
             previousValue = currentValue;
