@@ -22,6 +22,16 @@
 // live as today; a stop retired from a held note (a stop-filtered note-off) hands that
 // note's composite over first, so the retired stop's own voice can be released.
 //
+// Restrike (composite mode, a piston on held notes): a composite only lives for the first
+// T_h of its note, so a registration change then has two cases. Past T_h the note is live
+// pipes, and live registration applies. Before it, handing over would start every member
+// pipe; instead the composite is released into its summed tail (a kStopFilterCompositeRelease
+// note-off), and once the app has set the new registration, the note is struck again with
+// it (a kStopFilterRestrike note-on): the new composite, or its stops live. Stops still
+// sounding on the note (a stop that cannot be summed, drawn in both registrations) are left
+// alone, and a stop-filtered attack on a note waiting to be struck again is dropped, since
+// the strike will start that stop.
+//
 // Inert by default: no division has an active composite, composite regions never trigger
 // through normal dispatch, and the output is byte-identical to an engine without them.
 

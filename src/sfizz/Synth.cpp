@@ -1302,7 +1302,29 @@ void Synth::hdNoteOn(int delay, int noteNumber, float normalizedVelocity) noexce
     // The stop filter (live registration) further narrows a retro attack to ONE stop.
     impl.dispatchDivMask_ = divisionConsumeMask();
     impl.dispatchStopCc_ = stopConsumeFilter();
-    impl.noteOnDispatch(delay, noteNumber, normalizedVelocity);
+    uint32_t& restrike = impl.restrikeMask_[noteNumber];
+    if (impl.dispatchStopCc_ == kStopFilterRestrike) {
+        // Strike again (Composite.h): only the divisions whose composite was let go, with
+        // every drawn stop, but none still sounding on this key.
+        impl.dispatchDivMask_ &= restrike;
+        restrike &= ~impl.dispatchDivMask_;
+        impl.dispatchStopCc_ = kStopFilterNone;
+        impl.dispatchSounding_[0] = impl.dispatchSounding_[1] = 0;
+        impl.voiceManager_.forEachActive([&](Voice& voice) {
+            const TriggerEvent& event = voice.getTriggerEvent();
+            const int cc = voice.getGateCc();
+            if (cc >= 0 && cc < 128 && !voice.isFree() && !voice.isNoteOff()
+                && event.type == TriggerEventType::NoteOn && event.number == noteNumber
+                && (voice.getDivisionMask() & impl.dispatchDivMask_) != 0)
+                impl.dispatchSounding_[cc >> 6] |= uint64_t { 1 } << (cc & 63);
+        });
+        impl.dispatchRestrike_ = true;
+    } else if (impl.dispatchStopCc_ >= 0) {
+        impl.dispatchDivMask_ &= ~restrike;   // the strike to come starts this stop there
+    }
+    if (impl.dispatchDivMask_ != 0)
+        impl.noteOnDispatch(delay, noteNumber, normalizedVelocity);
+    impl.dispatchRestrike_ = false;
     impl.dispatchDivMask_ = kDivisionAll;
     impl.dispatchStopCc_ = kStopFilterNone;
 }
@@ -1343,13 +1365,42 @@ void Synth::hdNoteOff(int delay, int noteNumber, float normalizedVelocity) noexc
             && (voice.getDivisionMask() & impl.dispatchDivMask_) != 0;
     };
 
+    if (impl.dispatchStopCc_ == kStopFilterCompositeRelease) {
+        // A registration change before T_h (Composite.h, Restrike): each composite of this
+        // key lets go into its summed tail, as a note-off would, and nothing else of the
+        // key is touched; the key is marked to be struck again on its divisions.
+        std::array<std::pair<Voice*, Layer*>, 16> tails;
+        size_t numTails = 0;
+        impl.voiceManager_.forEachActive([&](Voice& voice) {
+            if (!isCompositeOnNote(voice) || voice.isNoteOff())
+                return;
+            impl.restrikeMask_[noteNumber] |= voice.getDivisionMask() & impl.dispatchDivMask_;
+            Layer* tail = voice.getCompositeLayer()->composite_.tail;
+            if (tail && sfz::releaseAlignEnabled() && numTails < tails.size()
+                && tail->registerNoteOff(noteNumber, replacedVelocity,
+                                         impl.randNoteDistribution_(Random::randomGenerator))) {
+                voice.prepareCompositeRelease(sfz::releaseAlignCrossfade());
+                tails[numTails++] = { &voice, tail };
+            }
+            voice.registerNoteOff(delay, noteNumber, replacedVelocity);
+        });
+        for (size_t i = 0; i < numTails; ++i)
+            impl.startCompositeTail(*tails[i].first, tails[i].second, delay, replacedVelocity);
+        impl.dispatchDivMask_ = kDivisionAll;
+        impl.dispatchStopCc_ = kStopFilterNone;
+        return;
+    }
+    if (impl.dispatchStopCc_ < 0)
+        impl.restrikeMask_[noteNumber] &= ~impl.dispatchDivMask_;   // the key is let go
+
     // Composite stops (Composite.h): a stop retired from a held note hands the note's
     // composite over first, so that stop's own voice exists to be released below.
     if (impl.dispatchStopCc_ >= 0) {
-        for (auto& voice : impl.voiceManager_)
-            if (isCompositeOnNote(voice)
+        impl.voiceManager_.forEachActive([&](Voice& voice) {
+            if (isCompositeOnNote(voice) && !voice.isNoteOff()
                 && voice.getCompositeLayer()->composite_.hasMemberCc(impl.dispatchStopCc_))
                 impl.handOverComposite(voice);
+        });
     }
 
     // A composite released by this note-off fades into its summed tail, when tails are on
@@ -1748,6 +1799,9 @@ void Synth::Impl::noteOnDispatch(int delay, int noteNumber, float velocity) noex
             bool active = false;
             for (int d = 0; d < 32 && !active; ++d)
                 active = ((divisions >> d) & 1u) && compositeActive(d) == region.compositeId;
+            if (dispatchRestrike_ && ((link.memberCcs[0] & dispatchSounding_[0])
+                                      | (link.memberCcs[1] & dispatchSounding_[1])) != 0)
+                continue;   // a member still sounds on the key: the members play live
             if (!active || !layer->registerNoteOn(noteNumber, velocity, randValue))
                 continue;
             const TriggerEvent triggerEvent { TriggerEventType::NoteOn, noteNumber, velocity };
@@ -1770,6 +1824,9 @@ void Synth::Impl::noteOnDispatch(int delay, int noteNumber, float velocity) noex
         const int gateCc = layer->getRegion().gateCc;
         if (gateCc >= 0 && ((suppress[gateCc >> 6] >> (gateCc & 63)) & 1u))
             continue;   // played by the composite
+        if (dispatchRestrike_ && gateCc >= 0 && gateCc < 128
+            && ((dispatchSounding_[gateCc >> 6] >> (gateCc & 63)) & 1u))
+            continue;   // still sounding on the key (Composite.h, Restrike)
         if (layer->registerNoteOn(noteNumber, velocity, randValue)) {
             const Region& region = layer->getRegion();
             if (region.useTimerRange && !voiceManager_.withinValidTimerRange(&region, midiState.getInternalClock() + delay, sampleRate_))
@@ -2578,6 +2635,7 @@ void Synth::allSoundOff() noexcept
     Impl& impl = *impl_;
     for (auto& voice : impl.voiceManager_)
         voice.reset();
+    impl.restrikeMask_.fill(0);
     for (int i = 0; i < impl.numOutputs_; ++i) {
         for (auto& effectBus : impl.getEffectBusesForOutput(i))
             if (effectBus)

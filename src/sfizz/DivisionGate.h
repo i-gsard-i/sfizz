@@ -44,6 +44,12 @@ namespace sfz {
 
 constexpr uint32_t kDivisionAll = 0xFFFFFFFFu;
 constexpr int kStopFilterNone = -1;
+// A registration change on held notes (Composite.h, "Restrike"): two special filters.
+// On a note-off: release only the note's composites, each into its summed tail, and mark
+// the note to be struck again on those divisions. On a note-on: strike the marked note
+// again with the registration drawn now, leaving the stops still sounding on it alone.
+constexpr int kStopFilterCompositeRelease = -2;
+constexpr int kStopFilterRestrike = -3;
 
 // Return the pending event mask and reset it to all-bits.
 uint32_t divisionConsumeMask() noexcept;

@@ -402,6 +402,13 @@ struct Synth::Impl final: public Parser::Listener {
     // per gate CC: the members of a composite this note-off releases, whose tails are in
     // the summed tail (Composite.h). Cleared after the dispatch.
     uint64_t dispatchSuppressCc_[2] {};
+    // Per key, the divisions whose composite a kStopFilterCompositeRelease note-off let go,
+    // to be struck again by a kStopFilterRestrike note-on (Composite.h).
+    std::array<uint32_t, 128> restrikeMask_ {};
+    // Set while a restrike dispatches: stops still sounding on the key, one bit per gate
+    // CC, that it must not start again.
+    bool dispatchRestrike_ { false };
+    uint64_t dispatchSounding_[2] {};
 
     std::chrono::time_point<std::chrono::high_resolution_clock> lastGarbageCollection_;
 
