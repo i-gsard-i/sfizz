@@ -224,6 +224,24 @@ bool sfz::Region::parseOpcode(const Opcode& rawOpcode, bool cleanOpcode)
         }
         break;
     }
+    case hash("composite_octaves"): {
+        int bits {};
+        if (absl::SimpleAtoi(opcode.value, &bits) && bits >= 0 && bits <= 3)
+            compositeOctaves = bits;
+        break;
+    }
+    case hash("composite_memberkeys"): {
+        compositeMemberKeys.clear();
+        for (absl::string_view v : absl::StrSplit(opcode.value, ',')) {
+            int key {};
+            if (!absl::SimpleAtoi(trim(v), &key) || key < 0 || key > 127) {
+                compositeMemberKeys.clear();
+                break;
+            }
+            compositeMemberKeys.push_back(key);
+        }
+        break;
+    }
     case hash("composite_stops"): {
         compositeStops[0] = compositeStops[1] = 0;
         for (absl::string_view v : absl::StrSplit(opcode.value, ',')) {

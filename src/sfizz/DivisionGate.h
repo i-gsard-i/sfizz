@@ -50,6 +50,10 @@ constexpr int kStopFilterNone = -1;
 // again with the registration drawn now, leaving the stops still sounding on it alone.
 constexpr int kStopFilterCompositeRelease = -2;
 constexpr int kStopFilterRestrike = -3;
+// Octave couplers (Composite.h): on a note-on, strike the key and its coupled rows as the
+// division's octave composite, or as plain notes on each row where it has none; on a
+// note-off, let the key's octave composites go whole, into their summed tails.
+constexpr int kStopFilterOctave = -4;
 
 // Return the pending event mask and reset it to all-bits.
 uint32_t divisionConsumeMask() noexcept;

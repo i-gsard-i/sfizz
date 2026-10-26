@@ -160,12 +160,20 @@ public:
         Layer* tail { nullptr };
         Layer* staccato { nullptr };   // the staccato tail beside it, if any
         std::vector<Layer*> members;
+        std::vector<int> memberKeys;   // the key each member sounds on (an octave composite's rows)
         uint64_t memberCcs[2] {};   // one bit per member's stop gate CC
+        uint64_t rowCcs[3][2] {};   // the same per row of an octave composite: down, its key, up
         mutable float fullLevel { -1.0f };  // sqrt(sum of (amplitude * volume * loop rms)^2), lazily
         mutable std::vector<float> memberLevels;  // each member's amplitude * volume * loop rms
         bool hasMemberCc(int cc) const noexcept
         {
             return cc >= 0 && cc < 128 && ((memberCcs[cc >> 6] >> (cc & 63)) & 1u);
+        }
+        // An octave composite on `key`, octave couplers `octaves` (Region::compositeOctaves):
+        // whether it sounds `note`, its own row or a coupled one.
+        static bool rowOf(int key, int octaves, int note) noexcept
+        {
+            return note == key || ((octaves & 1) && note == key - 12) || ((octaves & 2) && note == key + 12);
         }
     } composite_;
 

@@ -283,6 +283,9 @@ void Synth::Impl::clear()
         list.clear();
     for (auto& list : compositeLists_)
         list.clear();
+    for (auto& list : compositeOctaveLists_)
+        list.clear();
+    compositeOctavesById_.clear();
     for (auto& list : ccActivationLists_)
         list.clear();
     previousKeyswitchLists_.clear();
@@ -846,7 +849,11 @@ void Synth::Impl::finalizeSfzLoad()
             // the attacks are listed apart, the summed tails nowhere.
             if (region.compositeId < 0)
                 noteActivationLists_[note].push_back(&layer);
-            else if (!region.isRelease())
+            else if (region.isRelease())
+                continue;
+            else if (region.compositeOctaves != 0)
+                compositeOctaveLists_[note].push_back(&layer);
+            else
                 compositeLists_[note].push_back(&layer);
         }
 
@@ -1302,6 +1309,13 @@ void Synth::hdNoteOn(int delay, int noteNumber, float normalizedVelocity) noexce
     // The stop filter (live registration) further narrows a retro attack to ONE stop.
     impl.dispatchDivMask_ = divisionConsumeMask();
     impl.dispatchStopCc_ = stopConsumeFilter();
+    if (impl.dispatchStopCc_ == kStopFilterOctave) {
+        // The key and its coupled rows at once (Composite.h, "Octave couplers").
+        impl.octaveNoteOn(delay, noteNumber, normalizedVelocity);
+        impl.dispatchDivMask_ = kDivisionAll;
+        impl.dispatchStopCc_ = kStopFilterNone;
+        return;
+    }
     uint32_t& restrike = impl.restrikeMask_[noteNumber];
     if (impl.dispatchStopCc_ == kStopFilterRestrike) {
         // Strike again (Composite.h): only the divisions whose composite was let go, with
@@ -1347,35 +1361,51 @@ void Synth::hdNoteOff(int delay, int noteNumber, float normalizedVelocity) noexc
     // auto replacedVelocity = (velocity == 0 ? getNoteVelocity(noteNumber) : velocity);
     MidiState& midiState = impl.resources_.getMidiState();
 
-    if (impl.lastKeyswitchLists_[noteNumber].empty())
-        midiState.noteOffEvent(delay, noteNumber, normalizedVelocity);
-
-    const auto replacedVelocity = midiState.getNoteVelocity(noteNumber);
-
     // Division-gated release (DivisionGate.h): only voices started by this division's
     // note-on respond, so the same key held on another manual keeps sounding. The stop
     // filter (live registration) further narrows a retro release to ONE stop's voices.
     impl.dispatchDivMask_ = divisionConsumeMask();
     impl.dispatchStopCc_ = stopConsumeFilter();
 
-    const auto isCompositeOnNote = [&](const Voice& voice) {
+    // An octave release is not a note-off of the key: the rows' own note-offs follow it.
+    if (impl.lastKeyswitchLists_[noteNumber].empty() && impl.dispatchStopCc_ != kStopFilterOctave)
+        midiState.noteOffEvent(delay, noteNumber, normalizedVelocity);
+
+    const auto replacedVelocity = midiState.getNoteVelocity(noteNumber);
+
+    // A composite sounding this key: a plain one struck on it, or an octave one with this
+    // key among its rows (Composite.h, "Octave couplers").
+    const auto coversNote = [&](const Voice& voice) {
+        const Layer* layer = voice.getCompositeLayer();
         const TriggerEvent& event = voice.getTriggerEvent();
-        return voice.getCompositeLayer() != nullptr && !voice.isFree()
-            && event.type == TriggerEventType::NoteOn && event.number == noteNumber
-            && (voice.getDivisionMask() & impl.dispatchDivMask_) != 0;
+        if (layer == nullptr || voice.isFree() || event.type != TriggerEventType::NoteOn
+            || (voice.getDivisionMask() & impl.dispatchDivMask_) == 0)
+            return false;
+        const int octaves = layer->getRegion().compositeOctaves;
+        return octaves == 0 ? event.number == noteNumber
+                            : Layer::CompositeLink::rowOf(event.number, octaves, noteNumber);
+    };
+    const auto isOctave = [](const Voice& voice) {
+        return voice.getCompositeLayer()->getRegion().compositeOctaves != 0;
+    };
+    // A plain composite struck on this key.
+    const auto isCompositeOnNote = [&](const Voice& voice) {
+        return coversNote(voice) && !isOctave(voice);
     };
 
-    if (impl.dispatchStopCc_ == kStopFilterCompositeRelease) {
-        // A registration change before T_h (Composite.h, Restrike): each composite of this
-        // key lets go into its summed tail, as a note-off would, and nothing else of the
-        // key is touched; the key is marked to be struck again on its divisions.
+    if (impl.dispatchStopCc_ == kStopFilterOctave) {
+        // Every row of the key's octave composites goes at once: each fades into its
+        // summed tail, as a plain composite does. Nothing else is touched; the rows'
+        // note-offs that follow find it gone, and release what the key sounds live.
         std::array<std::pair<Voice*, Layer*>, 16> tails;
         size_t numTails = 0;
         impl.voiceManager_.forEachActive([&](Voice& voice) {
-            if (!isCompositeOnNote(voice) || voice.isNoteOff())
+            if (!coversNote(voice) || !isOctave(voice) || voice.isNoteOff()
+                || voice.getTriggerEvent().number != noteNumber)
                 return;
-            impl.restrikeMask_[noteNumber] |= voice.getDivisionMask() & impl.dispatchDivMask_;
             Layer* tail = voice.getCompositeLayer()->composite_.tail;
+            if (tail == nullptr)
+                impl.prepareCompositeFade(voice);
             if (tail && sfz::releaseAlignEnabled() && numTails < tails.size()
                 && tail->registerNoteOff(noteNumber, replacedVelocity,
                                          impl.randNoteDistribution_(Random::randomGenerator))) {
@@ -1390,15 +1420,54 @@ void Synth::hdNoteOff(int delay, int noteNumber, float normalizedVelocity) noexc
         impl.dispatchStopCc_ = kStopFilterNone;
         return;
     }
+
+    if (impl.dispatchStopCc_ == kStopFilterCompositeRelease) {
+        // A registration change before T_h (Composite.h, Restrike): each composite of this
+        // key lets go into its summed tail, as a note-off would, and nothing else of the
+        // key is touched; the key is marked to be struck again on its divisions (an octave
+        // composite: each of its rows, which the app strikes again one by one).
+        std::array<std::pair<Voice*, Layer*>, 16> tails;
+        size_t numTails = 0;
+        impl.voiceManager_.forEachActive([&](Voice& voice) {
+            if (!coversNote(voice) || voice.isNoteOff())
+                return;
+            const uint32_t divisions = voice.getDivisionMask() & impl.dispatchDivMask_;
+            const int key = voice.getTriggerEvent().number;
+            const int octaves = voice.getCompositeLayer()->getRegion().compositeOctaves;
+            for (int row : { key - 12, key, key + 12 })
+                if (row >= 0 && row < 128 && (octaves == 0 ? row == noteNumber : Layer::CompositeLink::rowOf(key, octaves, row)))
+                    impl.restrikeMask_[row] |= divisions;
+            // on the key it was struck on, the one its tail region answers to
+            Layer* tail = voice.getCompositeLayer()->composite_.tail;
+            if (tail == nullptr)
+                impl.prepareCompositeFade(voice);
+            if (tail && sfz::releaseAlignEnabled() && numTails < tails.size()
+                && tail->registerNoteOff(key, replacedVelocity,
+                                         impl.randNoteDistribution_(Random::randomGenerator))) {
+                voice.prepareCompositeRelease(sfz::releaseAlignCrossfade());
+                tails[numTails++] = { &voice, tail };
+            }
+            voice.registerNoteOff(delay, key, replacedVelocity);
+        });
+        for (size_t i = 0; i < numTails; ++i)
+            impl.startCompositeTail(*tails[i].first, tails[i].second, delay, replacedVelocity);
+        impl.dispatchDivMask_ = kDivisionAll;
+        impl.dispatchStopCc_ = kStopFilterNone;
+        return;
+    }
     if (impl.dispatchStopCc_ < 0)
         impl.restrikeMask_[noteNumber] &= ~impl.dispatchDivMask_;   // the key is let go
 
     // Composite stops (Composite.h): a stop retired from a held note hands the note's
-    // composite over first, so that stop's own voice exists to be released below.
-    if (impl.dispatchStopCc_ >= 0) {
+    // composite over first, so that stop's own voice exists to be released below. A note-off
+    // of one row of an octave composite does too, whatever it releases: the other rows may
+    // still be held (by this key, or another), and only live pipes can go one row at a time.
+    if (impl.dispatchStopCc_ >= 0 || impl.dispatchStopCc_ == kStopFilterNone) {
         impl.voiceManager_.forEachActive([&](Voice& voice) {
-            if (isCompositeOnNote(voice) && !voice.isNoteOff()
-                && voice.getCompositeLayer()->composite_.hasMemberCc(impl.dispatchStopCc_))
+            if (!coversNote(voice) || voice.isNoteOff())
+                return;
+            if (impl.dispatchStopCc_ >= 0 ? voice.getCompositeLayer()->composite_.hasMemberCc(impl.dispatchStopCc_)
+                                          : isOctave(voice))
                 impl.handOverComposite(voice);
         });
     }
@@ -1416,6 +1485,8 @@ void Synth::hdNoteOff(int delay, int noteNumber, float normalizedVelocity) noexc
             const Layer::CompositeLink& link = voice.getCompositeLayer()->composite_;
             impl.dispatchSuppressCc_[0] |= link.memberCcs[0];
             impl.dispatchSuppressCc_[1] |= link.memberCcs[1];
+            if (link.tail == nullptr)
+                impl.prepareCompositeFade(voice);
             Layer* tail = link.tail;
             if (tail && sfz::releaseAlignEnabled() && numCompositeTails < compositeTails.size()
                 && tail->registerNoteOff(noteNumber, replacedVelocity,
@@ -1562,6 +1633,12 @@ void Synth::Impl::resolveComposites() noexcept
         Layer::CompositeLink& link = layerPtr->composite_;
         bool ok = region.compositeTh > 0 && !region.compositeMembers.empty()
             && region.compositeMembers.size() <= kMaxCompositeMembers;
+        // An octave composite names each member's key; a plain one sounds them all on its own.
+        const bool octave = region.compositeOctaves != 0;
+        ok = ok && (octave ? region.compositeMemberKeys.size() == region.compositeMembers.size()
+                           : region.compositeMemberKeys.empty());
+        if (octave)
+            compositeOctavesById_[region.compositeId] = region.compositeOctaves;
         if (ok && !region.compositeTail.empty()) {
             const auto it = tails.find(region.compositeTail);
             ok = it != tails.end();
@@ -1576,7 +1653,8 @@ void Synth::Impl::resolveComposites() noexcept
         }
         for (size_t i = 0; ok && i < region.compositeMembers.size(); ++i) {
             // The member: a region of that file on the composite's manual, the one whose
-            // keys hold the composite's key if there are several (a sample shared by keys).
+            // keys hold the member's key if there are several (a sample shared by keys):
+            // the composite's key, or for an octave composite the row's (its memberkeys).
             // It must carry its stop's gate CC: that is how its own pipes are kept silent
             // while the composite plays them.
             // With `composite_stops`, it must also be one of those stops: a borrowed rank
@@ -1584,8 +1662,8 @@ void Synth::Impl::resolveComposites() noexcept
             Layer* member = nullptr;
             const auto it = attacks.find(region.compositeMembers[i]);
             const bool byCc = (region.compositeStops[0] | region.compositeStops[1]) != 0;
+            const int key = octave ? region.compositeMemberKeys[i] : region.keyRange.getStart();
             if (it != attacks.end()) {
-                const uint8_t key = region.keyRange.getStart();
                 for (Layer* cand : it->second) {
                     const Region& r = cand->getRegion();
                     if ((r.divMask & region.divMask) == 0 || r.gateCc < 0 || r.gateCc >= 128)
@@ -1593,8 +1671,12 @@ void Synth::Impl::resolveComposites() noexcept
                     if (byCc && !((region.compositeStops[r.gateCc >> 6] >> (r.gateCc & 63)) & 1u))
                         continue;
                     // One file twice in the list is two stops sharing a pipe (a borrowed
-                    // bass): each entry is a different stop's region.
-                    if (std::find(link.members.begin(), link.members.end(), cand) != link.members.end())
+                    // bass): each entry is a different stop's region. On an octave
+                    // composite, one region on two rows is one stop's sample on two keys.
+                    bool taken = false;
+                    for (size_t j = 0; j < link.members.size() && !taken; ++j)
+                        taken = link.members[j] == cand && link.memberKeys[j] == key;
+                    if (taken)
                         continue;
                     if (member == nullptr || r.keyRange.containsWithEnd(key))
                         member = cand;
@@ -1606,18 +1688,18 @@ void Synth::Impl::resolveComposites() noexcept
             if (ok) {
                 const int cc = member->getRegion().gateCc;
                 link.members.push_back(member);
+                link.memberKeys.push_back(key);
                 link.memberLevels.reserve(region.compositeMembers.size());
                 link.memberCcs[cc >> 6] |= uint64_t { 1 } << (cc & 63);
+                const int row = key < region.keyRange.getStart() ? 0 : (key > region.keyRange.getStart() ? 2 : 1);
+                link.rowCcs[row][cc >> 6] |= uint64_t { 1 } << (cc & 63);
             }
         }
         link.valid = ok;
         if (!ok) {
             DBG("[sfizz] Composite region " << region.sampleId->filename() << " is not used: "
                 << "its tail or a member is missing, or a member has no stop_cc");
-            link.members.clear();
-            link.tail = nullptr;
-            link.staccato = nullptr;
-            link.memberCcs[0] = link.memberCcs[1] = 0;
+            link = Layer::CompositeLink {};
         }
     }
 }
@@ -1662,8 +1744,14 @@ void Synth::Impl::handOverComposite(Voice& composite) noexcept
 
     std::array<Voice*, kMaxCompositeMembers> started {};
     const size_t n = std::min(link.members.size(), started.size());
-    for (size_t i = 0; i < n; ++i)
-        started[i] = startVoice(link.members[i], 0, event, ring);
+    for (size_t i = 0; i < n; ++i) {
+        // Each on its own key: an octave composite's coupled rows are notes an octave away,
+        // which their own note-offs find, as live.
+        TriggerEvent own = event;
+        if (i < link.memberKeys.size())
+            own.number = link.memberKeys[i];
+        started[i] = startVoice(link.members[i], 0, own, ring);
+    }
 
     // Starting a voice can steal one when none is free; if that was the composite itself,
     // its state is gone and the members simply start from their own beginning.
@@ -1683,6 +1771,112 @@ void Synth::Impl::handOverComposite(Voice& composite) noexcept
     for (size_t i = 0; i < n; ++i)
         if (started[i] != nullptr)
             started[i]->setDivisionMask(divisions & link.members[i]->getRegion().divMask);
+}
+
+void Synth::Impl::octaveNoteOn(int delay, int noteNumber, float velocity) noexcept
+{
+    const uint32_t mask = dispatchDivMask_;
+    // Each division's couplers, from its active octave composite (0: none active).
+    const auto couplersOf = [this](int division) {
+        const int id = compositeOctaveActive(division);
+        const auto it = id < 0 ? compositeOctavesById_.end() : compositeOctavesById_.find(id);
+        return it == compositeOctavesById_.end() ? 0 : it->second;
+    };
+    // The coupled rows' own note-ons, as live (hdNoteOn counted the key's).
+    int rows = 0;
+    for (int d = 0; d < 32; ++d)
+        if ((mask >> d) & 1u)
+            rows |= couplersOf(d);
+    MidiState& midiState = resources_.getMidiState();
+    for (int row : { noteNumber - 12, noteNumber + 12 })
+        if (row >= 0 && row < 128 && Layer::CompositeLink::rowOf(noteNumber, rows, row) && row != noteNumber
+            && lastKeyswitchLists_[row].empty())
+            midiState.noteOnEvent(delay, row, velocity);
+
+    // The octave composite of each division, one draw of it, as the plain composite path
+    // picks one (noteOnDispatch).
+    uint32_t left = mask;
+    const auto randValue = randNoteDistribution_(Random::randomGenerator);
+    SisterVoiceRingBuilder ring;
+    for (Layer* layer : compositeOctaveLists_[noteNumber]) {
+        const Region& region = layer->getRegion();
+        const Layer::CompositeLink& link = layer->composite_;
+        const uint32_t divisions = region.divMask & left;
+        uint32_t active = 0;
+        for (int d = 0; d < 32; ++d)
+            if (((divisions >> d) & 1u) && compositeOctaveActive(d) == region.compositeId)
+                active |= 1u << d;
+        if (!link.valid || active == 0 || !layer->registerNoteOn(noteNumber, velocity, randValue))
+            continue;
+        dispatchDivMask_ = active;
+        const TriggerEvent triggerEvent { TriggerEventType::NoteOn, noteNumber, velocity };
+        Voice* voice = startVoice(layer, delay, triggerEvent, ring);
+        if (voice == nullptr)
+            continue;   // no voice: the rows play as plain notes below
+        voice->setCompositeLayer(layer);
+        for (const Layer* member : link.members)
+            voice->holdCompositeStream(member->getRegion().sampleId);
+        left &= ~active;
+        // The pipes of its rows that its sum left out (no recorded tail or alignment entry
+        // there) play live beside it, as beside a plain composite.
+        dispatchStopCc_ = kStopFilterNone;
+        dispatchBesideOctave_ = true;
+        const int key = noteNumber;
+        int index = 0;
+        for (int row : { key - 12, key, key + 12 }) {
+            const uint64_t* members = link.rowCcs[index++];
+            if (row < 0 || row >= 128 || !Layer::CompositeLink::rowOf(key, region.compositeOctaves, row))
+                continue;
+            dispatchRowMembers_[0] = members[0];
+            dispatchRowMembers_[1] = members[1];
+            noteOnDispatch(delay, row, velocity);
+        }
+        dispatchBesideOctave_ = false;
+        dispatchRowMembers_[0] = dispatchRowMembers_[1] = 0;
+        dispatchStopCc_ = kStopFilterOctave;
+    }
+
+    // Where none sounds (a key it has no region for: fewer than two pipes there), each row
+    // as a plain note, through the plain composites like any other note.
+    dispatchStopCc_ = kStopFilterNone;
+    for (int couplers = 0; couplers <= 3 && left != 0; ++couplers) {
+        uint32_t divisions = 0;
+        for (int d = 0; d < 32; ++d)
+            if (((left >> d) & 1u) && couplersOf(d) == couplers)
+                divisions |= 1u << d;
+        if (divisions == 0)
+            continue;
+        left &= ~divisions;
+        for (int row : { noteNumber, noteNumber - 12, noteNumber + 12 }) {
+            if (row < 0 || row >= 128 || !Layer::CompositeLink::rowOf(noteNumber, couplers, row))
+                continue;
+            dispatchDivMask_ = divisions;
+            noteOnDispatch(delay, row, velocity);
+        }
+    }
+    dispatchDivMask_ = mask;
+}
+
+void Synth::Impl::prepareCompositeFade(Voice& composite) noexcept
+{
+    // Its members share the envelope it plays with (the renderer sums no others), so it
+    // already fades as they would, except in one case: with the release tails on, a looping
+    // pipe that has no alignment entry fades over the fallback time instead (Voice.cpp,
+    // registerNoteOff). The composite does not loop, so it is told here.
+    const Layer* layer = composite.getCompositeLayer();
+    if (layer == nullptr || layer->composite_.members.empty() || !sfz::releaseAlignEnabled())
+        return;
+    const Region& member = layer->composite_.members[0]->getRegion();
+    if (!member.shouldLoop())
+        return;
+    float period = 0.0f, loopRms = 0.0f; int anchor = 0;
+    const uint8_t* track = nullptr; size_t trackSize = 0;
+    if (sfz::releaseAlignLookup(member.sampleId->filename(), period, anchor, loopRms, track, trackSize))
+        return;
+    if (ADSREnvelope* eg = composite.getAmplitudeEG()) {
+        eg->setReleaseTime(sfz::releaseAlignFallback());
+        eg->stopDynamicUpdates();
+    }
 }
 
 void Synth::Impl::startCompositeTail(Voice& composite, Layer* tail, int delay, float velocity) noexcept
@@ -1807,8 +2001,8 @@ void Synth::Impl::noteOnDispatch(int delay, int noteNumber, float velocity) noex
     // key) plays instead of its member pipes, which are skipped below. It requests their
     // streams now, so they are read as early as in live playing. A retro attack (stop
     // filter) is a single stop's pipe and never a composite.
-    uint64_t suppress[2] {};
-    if (dispatchStopCc_ < 0 && compositeAnyActive()) {
+    uint64_t suppress[2] { dispatchRowMembers_[0], dispatchRowMembers_[1] };
+    if (dispatchStopCc_ < 0 && !dispatchBesideOctave_ && compositeAnyActive()) {
         for (Layer* layer : compositeLists_[noteNumber]) {
             const Region& region = layer->getRegion();
             const Layer::CompositeLink& link = layer->composite_;

@@ -304,6 +304,14 @@ struct Region {
     // tail at its own scale (organdroid docs/design/COMPOSITE_STOPS_DESIGN.md §4d).
     std::string compositeStaccato; // composite_staccato
     std::vector<float> compositeStaccatoScale; // composite_staccatoscale
+    // An octave composite (Composite.h, "Octave couplers"): the octave couplers drawn with
+    // its stops, one bit each, 1 = the sub coupler (16', the row an octave down) and 2 =
+    // the super coupler (4', the row an octave up), and each member's own key
+    // (`composite_memberkeys`, comma-separated, in `composite_member` order): a member of a
+    // coupled row sounds an octave from the composite's key. 0 and empty = a plain composite,
+    // every member on its key.
+    int compositeOctaves { 0 }; // composite_octaves
+    std::vector<int> compositeMemberKeys; // composite_memberkeys
 
     // Region logic: key mapping
     UncheckedRange<uint8_t> keyRange { Default::loKey, Default::hiKey }; //lokey, hikey and key

@@ -32,6 +32,20 @@
 // alone, and a stop-filtered attack on a note waiting to be struck again is dropped, since
 // the strike will start that stop.
 //
+// Octave couplers: a manual's sub (16') and super (4') couplers play its stops an octave
+// down and up as well, which live is three notes per key, so three composites. An octave
+// composite (`composite_octaves=`) sums the coupled rows too, each member on its own key
+// (`composite_memberkeys=`): one voice for the key and its octaves. Each row is still a pipe
+// the app counts on its own (one pipe speaks once: a row another held key already sounds
+// is not struck again), so the app strikes one only where every row is free, as one
+// kStopFilterOctave note-on on the key; elsewhere it strikes the rows as plain notes.
+// The rows are let go one note-off each, as live. The app sends the key's
+// kStopFilterOctave note-off first when every row goes at once: the composite then fades
+// into its summed tail, as a plain one does. Any other note-off on one of its rows
+// (another key still holds a row, a stop retired, a coupler pushed in, a restrike) finds
+// it whole: it hands over first, each member on its own key, and the note-off then acts on
+// the live pipes, as it would have without composites.
+//
 // Inert by default: no division has an active composite, composite regions never trigger
 // through normal dispatch, and the output is byte-identical to an engine without them.
 
@@ -43,7 +57,10 @@ extern "C" {
 // Make composite `id` (the `composite=` value of its regions) the one new notes of
 // console division `division` (0-based, the `division=` index) use; -1 = none.
 void sfizz_composite_activate(int division, int id);
-// Deactivate every division.
+// Make octave composite `id` the one a kStopFilterOctave note-on of `division` strikes;
+// -1 = none (the rows are then struck as plain notes).
+void sfizz_composite_activate_octave(int division, int id);
+// Deactivate every division, plain and octave.
 void sfizz_composite_clear();
 }
 
@@ -57,5 +74,8 @@ int compositeActive(int division) noexcept;
 
 // True when some division has an active composite (a cheap guard for the note path).
 bool compositeAnyActive() noexcept;
+
+// The octave composite active for division `division` (0..31), -1 = none.
+int compositeOctaveActive(int division) noexcept;
 
 } // namespace sfz

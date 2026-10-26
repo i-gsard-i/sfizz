@@ -12,6 +12,17 @@ std::atomic<int> g_active[32] = {
     {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1},
 };
 std::atomic<uint32_t> g_activeMask { 0 };
+std::atomic<int> g_octave[32] = {
+    {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1},
+    {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1}, {-1},
+};
+}
+
+extern "C" void sfizz_composite_activate_octave(int division, int id)
+{
+    if (division < 0 || division >= 32)
+        return;
+    g_octave[division].store(id < 0 ? -1 : id, std::memory_order_relaxed);
 }
 
 extern "C" void sfizz_composite_activate(int division, int id)
@@ -30,6 +41,8 @@ extern "C" void sfizz_composite_clear()
 {
     for (auto& a : g_active)
         a.store(-1, std::memory_order_relaxed);
+    for (auto& a : g_octave)
+        a.store(-1, std::memory_order_relaxed);
     g_activeMask.store(0, std::memory_order_relaxed);
 }
 
@@ -45,6 +58,13 @@ int compositeActive(int division) noexcept
 bool compositeAnyActive() noexcept
 {
     return g_activeMask.load(std::memory_order_relaxed) != 0;
+}
+
+int compositeOctaveActive(int division) noexcept
+{
+    if (division < 0 || division >= 32)
+        return -1;
+    return g_octave[division].load(std::memory_order_relaxed);
 }
 
 } // namespace sfz

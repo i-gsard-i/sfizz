@@ -15,6 +15,7 @@
 #include "modulations/sources/LFO.h"
 #include "parser/Parser.h"
 #include "parser/ParserListener.h"
+#include <absl/container/flat_hash_map.h>
 
 namespace sfz {
 
@@ -178,6 +179,20 @@ struct Synth::Impl final: public Parser::Listener {
     void handOverComposite(Voice& composite) noexcept;
 
     /**
+     * @brief A kStopFilterOctave note-on (Composite.h, "Octave couplers"): on each division
+     * of the event, the key and its coupled rows as that division's octave composite, or as
+     * plain notes on each row where it has none for the key.
+     */
+    void octaveNoteOn(int delay, int noteNumber, float velocity) noexcept;
+
+    /**
+     * @brief Before a note-off of a composite without a summed tail (stops without recorded
+     * tails, which release by their envelope): give its envelope the release its members'
+     * would get, so it fades as they would.
+     */
+    void prepareCompositeFade(Voice& composite) noexcept;
+
+    /**
      * @brief Fill in a composite link's member levels and full level, once.
      */
     void compositeLevels(const Layer::CompositeLink& link) noexcept;
@@ -337,6 +352,10 @@ struct Synth::Impl final: public Parser::Listener {
     // Composite attack layers per key (Composite.h); kept out of noteActivationLists_,
     // since only the composite path starts them.
     std::array<LayerViewVector, 128> compositeLists_;
+    // The octave composites' attack layers per key, which only a kStopFilterOctave note-on
+    // starts, and each octave composite's couplers by its id (Region::compositeOctaves).
+    std::array<LayerViewVector, 128> compositeOctaveLists_;
+    absl::flat_hash_map<int, int> compositeOctavesById_;
     std::array<LayerViewVector, config::numCCs> ccActivationLists_;
 
     // Effect factory and buses
@@ -411,6 +430,11 @@ struct Synth::Impl final: public Parser::Listener {
     // CC, that it must not start again.
     bool dispatchRestrike_ { false };
     uint64_t dispatchSounding_[2] {};
+    // Set while a row of an octave composite just struck dispatches (Composite.h, "Octave
+    // couplers"): the pipes its sum left out start live beside it, so no composite starts
+    // and its members on that row (one bit per gate CC) are skipped.
+    bool dispatchBesideOctave_ { false };
+    uint64_t dispatchRowMembers_[2] {};
 
     std::chrono::time_point<std::chrono::high_resolution_clock> lastGarbageCollection_;
 
