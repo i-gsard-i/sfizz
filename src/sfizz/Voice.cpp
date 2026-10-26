@@ -53,6 +53,18 @@ extern "C" void sfizz_set_prefetch_distance(int d) {
     sPrefetchDistance.store(d, std::memory_order_relaxed);
 }
 
+// Dropped pipes (STREAMING_SAFETY_DESIGN.md §6): voices that reached the end of the data
+// available to them (the preload head) while their sample went on, because the stream had
+// not arrived. Such a pipe stops: silent, so no xrun count or CPU meter can see it. Counted
+// once per voice; the audio thread only increments, the app reads and resets at each load.
+namespace { std::atomic<uint32_t> sDroppedPipes { 0 }; }
+extern "C" uint32_t sfizz_dropped_pipes() {
+    return sDroppedPipes.load(std::memory_order_relaxed);
+}
+extern "C" void sfizz_dropped_pipes_reset() {
+    sDroppedPipes.store(0, std::memory_order_relaxed);
+}
+
 namespace sfz {
 
 struct Voice::Impl
@@ -270,6 +282,7 @@ struct Voice::Impl
     uint32_t count_ { 1 };
     int sampleEnd_ { 0 };
     int sampleSize_ { 0 };
+    bool dropped_ { false };            // counted in sDroppedPipes already (fillWithData)
 
     struct {
         int start { 0 };
@@ -554,6 +567,7 @@ bool Voice::startVoice(Layer* layer, int delay, const TriggerEvent& event) noexc
     impl.baseFrequency_ = tuning.getFrequencyOfKey(impl.triggerEvent_.number);
     impl.sampleEnd_ = int(sampleEnd(region, midiState));
     impl.sampleSize_ = impl.sampleEnd_- impl.sourcePosition_ - 1;
+    impl.dropped_ = false;
     impl.bendSmoother_.setSmoothing(region.bendSmooth, impl.sampleRate_);
     impl.bendSmoother_.reset(region.getBendInCents(midiState.getPitchBend()));
 
@@ -1302,6 +1316,14 @@ void Voice::Impl::fillWithData(AudioSpan<float> buffer) noexcept
     }
 
     const auto sampleEnd = min( int(sampleEnd_), int(currentPromise_->information.end), int(source.getNumFrames())) - 1;
+    // The data runs out before the sample does: reaching sampleEnd is a dropped pipe.
+    const bool sourceShort = int(source.getNumFrames()) < min(int(sampleEnd_), int(currentPromise_->information.end));
+    const auto countDropped = [&] {
+        if (sourceShort && !dropped_) {
+            dropped_ = true;
+            sDroppedPipes.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
 
     int blockRestarts { 0 };
     int oldIndex {};
@@ -1347,6 +1369,7 @@ void Voice::Impl::fillWithData(AudioSpan<float> buffer) noexcept
         while (i < numSamples) { // In case we released within the block, continue as if it were a one-shot
             (*indices)[i] -= loop.size * blockRestarts;
             if ((*indices)[i] >= sampleEnd) {
+                countDropped();
                 fill<int>(indices->subspan(i), sampleEnd);
                 fill<float>(coeffs->subspan(i), 0x1.fffffep-1);
                 break;
@@ -1365,6 +1388,7 @@ void Voice::Impl::fillWithData(AudioSpan<float> buffer) noexcept
                     continue;
                 }
 
+                countDropped();
                 off(int(i), true);
                 fill<int>(indices->subspan(i), sampleEnd);
                 fill<float>(coeffs->subspan(i), 0x1.fffffep-1);
