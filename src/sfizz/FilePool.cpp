@@ -113,6 +113,46 @@ extern "C" int sfizz_stream_timings(uint32_t* frames, uint32_t* micros, int max)
     return n;
 }
 
+// The streamed buffers held in RAM and the collector's last pass (design 4f; the M31 check
+// found streamed files kept after playing). Bytes and files are added when a stream is
+// Done and taken off when the collector frees it; reset at each palette load (a palette's
+// own pool is freed whole with it). The pass figures are the last pass's: files kept
+// because a voice still reads them, kept because idle less than fileClearingPeriod, and
+// freed, plus the lastUsedFiles left after it.
+namespace {
+std::atomic<int64_t> streamBytes { 0 };
+std::atomic<int> streamFiles { 0 };
+std::atomic<int> gcPasses { 0 };
+std::atomic<int> gcKeptReading { 0 };
+std::atomic<int> gcKeptRecent { 0 };
+std::atomic<int> gcFreed { 0 };
+std::atomic<int> gcPending { 0 };
+
+int64_t streamedBytes(const sfz::FileAudioBuffer& b)
+{
+    return static_cast<int64_t>(b.getNumFrames() * b.getNumChannels() * sizeof(float));
+}
+} // namespace
+
+// out: {bytes, files, passes, kept reading, kept recent, freed, pending}
+extern "C" void sfizz_stream_cache(int64_t* out)
+{
+    out[0] = streamBytes.load(std::memory_order_relaxed);
+    out[1] = streamFiles.load(std::memory_order_relaxed);
+    out[2] = gcPasses.load(std::memory_order_relaxed);
+    out[3] = gcKeptReading.load(std::memory_order_relaxed);
+    out[4] = gcKeptRecent.load(std::memory_order_relaxed);
+    out[5] = gcFreed.load(std::memory_order_relaxed);
+    out[6] = gcPending.load(std::memory_order_relaxed);
+}
+
+extern "C" void sfizz_stream_cache_reset()
+{
+    streamBytes.store(0, std::memory_order_relaxed);
+    streamFiles.store(0, std::memory_order_relaxed);
+    gcPasses.store(0, std::memory_order_relaxed);
+}
+
 // Threads that serve streams (and decode the preload): the same count for both.
 extern "C" int sfizz_decode_threads()
 {
@@ -789,6 +829,8 @@ void sfz::FilePool::loadingJob(const QueuedFileData& data) noexcept
     streamFromFile(*reader, data.data->fileData, &data.data->availableFrames);
 
     data.data->status = FileData::Status::Done;
+    streamBytes.fetch_add(streamedBytes(data.data->fileData), std::memory_order_relaxed);
+    streamFiles.fetch_add(1, std::memory_order_relaxed);
     // Opening included: a stream pays it too. The wait for the Preloaded state is
     // normally nothing and is counted with it.
     recordStreamTiming(data.data->availableFrames.load(), microsSince(jobStart));
@@ -920,6 +962,7 @@ void sfz::FilePool::triggerGarbageCollection() noexcept
         return;
 
     const auto now = std::chrono::high_resolution_clock::now();
+    int keptReading = 0, keptRecent = 0, freed = 0;
     swapAndPopAll(lastUsedFiles, [&](const FileId& id) {
         if (garbageToCollect.size() == garbageToCollect.capacity())
            return false;
@@ -933,12 +976,16 @@ void sfz::FilePool::triggerGarbageCollection() noexcept
 
         sfz::FileData& data = it->second;
 
-        if (data.readerCount != 0)
+        if (data.readerCount != 0) {
+            ++keptReading;
             return false;
+        }
 
         const auto secondsIdle = std::chrono::duration_cast<std::chrono::seconds>(now - data.lastViewerLeftAt).count();
-        if (secondsIdle < config::fileClearingPeriod)
+        if (secondsIdle < config::fileClearingPeriod) {
+            ++keptRecent;
             return false;
+        }
 
         auto status = data.status.load();
         if (status == FileData::Status::Preloaded) {
@@ -957,6 +1004,9 @@ void sfz::FilePool::triggerGarbageCollection() noexcept
             auto readerCount = data.readerCount.load();
             if (readerCount == 0) {
                 data.availableFrames = 0;
+                streamBytes.fetch_sub(streamedBytes(data.fileData), std::memory_order_relaxed);
+                streamFiles.fetch_sub(1, std::memory_order_relaxed);
+                ++freed;
                 garbageToCollect.push_back(std::move(data.fileData));
                 data.status = FileData::Status::Preloaded;
                 return true;
@@ -965,6 +1015,11 @@ void sfz::FilePool::triggerGarbageCollection() noexcept
         }
         return false;
     });
+    gcPasses.fetch_add(1, std::memory_order_relaxed);
+    gcKeptReading.store(keptReading, std::memory_order_relaxed);
+    gcKeptRecent.store(keptRecent, std::memory_order_relaxed);
+    gcFreed.store(freed, std::memory_order_relaxed);
+    gcPending.store(static_cast<int>(lastUsedFiles.size()), std::memory_order_relaxed);
 
     std::error_code ec;
     semGarbageBarrier.post(ec);

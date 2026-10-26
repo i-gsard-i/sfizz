@@ -187,7 +187,9 @@ public:
             return;
 
         data->readerCount -= 1;
-        data->lastViewerLeftAt = highResNow();
+        // organdroid: the real clock, once per voice end. highResNow() is a constant under
+        // SFIZZ_NO_TIMING, and the collector measures the idle time from this.
+        data->lastViewerLeftAt = std::chrono::high_resolution_clock::now();
         data = nullptr;
     }
     ~FileDataHolder()

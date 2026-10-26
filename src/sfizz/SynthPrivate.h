@@ -436,7 +436,9 @@ struct Synth::Impl final: public Parser::Listener {
     bool dispatchBesideOctave_ { false };
     uint64_t dispatchRowMembers_[2] {};
 
-    std::chrono::time_point<std::chrono::high_resolution_clock> lastGarbageCollection_;
+    // organdroid: counted in frames, not read from highResNow(), which SFIZZ_NO_TIMING
+    // makes a constant: with it the collector never ran (2026-10-09 to 10-26).
+    size_t framesSinceGarbageCollection_ { 0 };
 
     Parser parser_;
     std::string lastPath_;

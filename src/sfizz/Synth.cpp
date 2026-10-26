@@ -1145,12 +1145,9 @@ void Synth::renderBlock(AudioSpan<float> buffer) noexcept
     if (synthConfig.freeWheeling)
         filePool.waitForBackgroundLoading();
 
-    const auto now = highResNow();
-    const auto timeSinceLastCollection =
-        std::chrono::duration_cast<std::chrono::seconds>(now - impl.lastGarbageCollection_);
-
-    if (timeSinceLastCollection.count() > config::fileClearingPeriod) {
-        impl.lastGarbageCollection_ = now;
+    impl.framesSinceGarbageCollection_ += buffer.getNumFrames();
+    if (impl.framesSinceGarbageCollection_ > config::fileClearingPeriod * impl.sampleRate_) {
+        impl.framesSinceGarbageCollection_ = 0;
         filePool.triggerGarbageCollection();
     }
 
