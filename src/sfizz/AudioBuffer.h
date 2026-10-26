@@ -278,7 +278,7 @@ public:
     {
         for (size_t i = 0; i < numChannels; ++i) {
             absl::Span<Type> paddedSpan { buffers[i]->data(), numFrames + PaddingTotal };
-            fill<Type>(paddedSpan, Type{ 0.0 });
+            fill<Type>(paddedSpan, Type {});
         }
     }
 

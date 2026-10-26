@@ -79,6 +79,14 @@ public:
         _setBufferSize(bufferSize);
     }
 
+    // Scratch for reading a packed 16-bit preload head (Voice.cpp, fillFromSource): a float
+    // window per channel, padded like a file buffer, and the read positions shifted into
+    // it. Fixed size, allocated with the pool, never on the audio thread; one voice reads
+    // at a time, so one window serves them all.
+    static constexpr size_t kHeadWindowFrames { 4096 };
+    float* headWindow(size_t channel) noexcept { return headWindows[channel].data(); }
+    int* headWindowIndices() noexcept { return headIndices.data(); }
+
     SpanHolder<absl::Span<float>> getBuffer(size_t numFrames)
     {
         const auto availableIt = absl::c_find(monoAvailable, 1);
@@ -171,6 +179,8 @@ private:
         absl::c_fill(indexAvailable, 1);
     }
 
+    std::array<sfz::Buffer<float>, 2> headWindows { sfz::Buffer<float>(kHeadWindowFrames), sfz::Buffer<float>(kHeadWindowFrames) };
+    sfz::Buffer<int> headIndices { kHeadWindowFrames };
     std::array<sfz::Buffer<float>, config::bufferPoolSize> monoBuffers;
     std::vector<int> monoAvailable;
     std::array<sfz::Buffer<int>, config::bufferPoolSize> indexBuffers;

@@ -117,6 +117,18 @@ struct Voice::Impl
         absl::Span<const float> addingGains, int quality);
 
     /**
+     * @brief fillInterpolatedWithQuality from a file source, float or a packed 16-bit
+     *        head. A packed head is read through a float window: the frames this read
+     *        needs, converted, then interpolated as before. The conversion is exact, so
+     *        the output is the float head's bit for bit.
+     */
+    template <bool Adding>
+    void fillFromSource(
+        const FileSource& source, const AudioSpan<float>& dest,
+        absl::Span<const int> indices, absl::Span<const float> coeffs,
+        absl::Span<const float> addingGains, int quality);
+
+    /**
      * @brief Get a S-shaped curve that is applicable to loop crossfading.
      */
     static const Curve& getSCurve();
@@ -1423,11 +1435,18 @@ void Voice::Impl::fillWithData(AudioSpan<float> buffer) noexcept
             && ptCoeffs[ptSize - 1] == 0.0f && ptIndices[ptSize - 1] == ptIndices[0] + int(ptSize - 1);
         if (wholeFrames) {
             for (size_t c = 0; c < source.getNumChannels(); ++c) {   // a mono source fills left only, as the interpolator does
-                const float* from = source.getConstSpan(c).data() + ptIndices[0];
-                std::copy(from, from + ptSize, ptBuffer.getSpan(c).data());
+                float* to = ptBuffer.getSpan(c).data();
+                if (source.isPacked()) {
+                    const int16_t* from = source.packed.getConstSpan(c).data() + ptIndices[0];
+                    for (size_t k = 0; k < ptSize; ++k)
+                        to[k] = float(from[k]) * kPackedHeadScale;
+                } else {
+                    const float* from = source.data.getConstSpan(c).data() + ptIndices[0];
+                    std::copy(from, from + ptSize, to);
+                }
             }
         } else
-            fillInterpolatedWithQuality<false>(
+            fillFromSource<false>(
                 source, ptBuffer, ptIndices, ptCoeffs, {}, quality);
 
         if (ptType == kPartitionLoopXfade) {
@@ -1517,7 +1536,7 @@ void Voice::Impl::fillWithData(AudioSpan<float> buffer) noexcept
                         xfCurve[i] = clamp(xfInCurvePos[i], 0.0f, 1.0f);
                 }
                 // apply in curve
-                fillInterpolatedWithQuality<true>(
+                fillFromSource<true>(
                     source, xfInBuffer, xfInIndices, xfInCoeffs, xfCurve, quality);
             }
         }
@@ -1580,6 +1599,68 @@ void Voice::Impl::fillInterpolated(
             }
             incrementAll(ind, left, right, coeff);
         }
+    }
+}
+
+template <bool Adding>
+void Voice::Impl::fillFromSource(
+    const FileSource& source, const AudioSpan<float>& dest,
+    absl::Span<const int> indices, absl::Span<const float> coeffs,
+    absl::Span<const float> addingGains, int quality)
+{
+    if (!source.isPacked()) {
+        fillInterpolatedWithQuality<Adding>(source.data, dest, indices, coeffs, addingGains, quality);
+        return;
+    }
+
+    // The interpolators read up to excessFileFrames either side of a position, which the
+    // window keeps as a margin; outside the head and its padding the window holds zeros,
+    // as the padding does.
+    BufferPool& pool = resources_.getBufferPool();
+    constexpr int margin = config::excessFileFrames;
+    constexpr int capacity = int(BufferPool::kHeadWindowFrames);
+    const int numChannels = int(source.getNumChannels());
+    const int first = -int(PackedHeadBuffer::PaddingLeft);
+    const int last = int(source.packed.getNumFrames() + PackedHeadBuffer::PaddingRight);
+    const size_t total = indices.size();
+    int* shifted = pool.headWindowIndices();
+
+    size_t done = 0;
+    while (done < total) {
+        // As many outputs as the window holds (one block at ordinary pitches).
+        size_t n = std::min(total - done, size_t(capacity - 2 * margin));
+        int lo, hi;
+        for (;;) {
+            lo = hi = indices[done];
+            for (size_t i = done; i < done + n; ++i) {
+                lo = std::min(lo, indices[i]);
+                hi = std::max(hi, indices[i]);
+            }
+            if (hi - lo + 1 + 2 * margin <= capacity || n == 1)
+                break;
+            n /= 2;
+        }
+        const int start = lo - margin;
+        const int count = hi - lo + 1 + 2 * margin;
+
+        const float* windows[2] { nullptr, nullptr };
+        for (int c = 0; c < numChannels; ++c) {
+            float* w = pool.headWindow(size_t(c));
+            const int16_t* head = source.packed.getConstSpan(size_t(c)).data();
+            for (int k = 0; k < count; ++k) {
+                const int idx = start + k;
+                w[k] = (idx >= first && idx < last) ? float(head[idx]) * kPackedHeadScale : 0.0f;
+            }
+            windows[c] = w;
+        }
+        for (size_t i = 0; i < n; ++i)
+            shifted[i] = indices[done + i] - start;
+
+        const AudioSpan<const float> window { windows, size_t(numChannels), 0, size_t(count) };
+        fillInterpolatedWithQuality<Adding>(window, dest.subspan(done, n),
+            absl::MakeConstSpan(shifted, n), coeffs.subspan(done, n),
+            Adding ? addingGains.subspan(done, n) : addingGains, quality);
+        done += n;
     }
 }
 

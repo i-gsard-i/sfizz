@@ -52,6 +52,25 @@ using FileAudioBuffer = AudioBuffer<float, 2, config::defaultAlignment,
                                     sfz::config::excessFileFrames, sfz::config::excessFileFrames>;
 using FileAudioBufferPtr = std::shared_ptr<FileAudioBuffer>;
 
+// A preload head held as 16-bit integers (organdroid patch, STREAMING_SAFETY_DESIGN.md
+// §4b): a head whose every sample is k/32768 for an integer k, which a 16-bit recording
+// decodes to, is kept as the k. Half the RAM of floats, and k * (1/32768) gives back the
+// decoded floats bit for bit. Same padding as the float buffers (the interpolators read
+// past both ends).
+using PackedHeadBuffer = AudioBuffer<int16_t, 2, config::defaultAlignment,
+                                     sfz::config::excessFileFrames, sfz::config::excessFileFrames>;
+constexpr float kPackedHeadScale { 1.0f / 32768.0f };
+
+// What a voice reads: float frames (the streamed file, or a head that could not be
+// packed) or a packed head. Exactly one of the two holds frames.
+struct FileSource {
+    AudioSpan<const float> data;
+    AudioSpan<const int16_t> packed;
+    bool isPacked() const noexcept { return packed.getNumFrames() > 0; }
+    size_t getNumFrames() const noexcept { return isPacked() ? packed.getNumFrames() : data.getNumFrames(); }
+    size_t getNumChannels() const noexcept { return isPacked() ? packed.getNumChannels() : data.getNumChannels(); }
+};
+
 struct FileInformation {
     int64_t end { Default::sampleEnd };
     int64_t maxOffset { 0 };
@@ -74,14 +93,27 @@ struct FileData
     {
 
     }
-    AudioSpan<const float> getData()
+    FileSource getData()
     {
         ASSERT(readerCount > 0);
-        if (status != Status::GarbageCollecting && availableFrames > preloadedData.getNumFrames())
-            return AudioSpan<const float>(fileData).first(availableFrames);
+        FileSource source;
+        if (status != Status::GarbageCollecting && availableFrames > headFrames())
+            source.data = AudioSpan<const float>(fileData).first(availableFrames);
+        else if (packedHead.getNumFrames() > 0)
+            source.packed = AudioSpan<const int16_t>(packedHead);
         else
-            return AudioSpan<const float>(preloadedData);
+            source.data = AudioSpan<const float>(preloadedData);
+        return source;
     }
+
+    size_t headFrames() const noexcept
+    {
+        return packedHead.getNumFrames() > 0 ? packedHead.getNumFrames() : preloadedData.getNumFrames();
+    }
+
+    // Takes a freshly read head: packed when every sample is a 16-bit value (and the file
+    // is not a wavetable, read as floats elsewhere), kept as floats otherwise.
+    void setHead(FileAudioBuffer&& head) noexcept;
 
     FileData(const FileData& other) = delete;
     FileData& operator=(const FileData& other) = delete;
@@ -90,6 +122,7 @@ struct FileData
         ASSERT(other.readerCount == 0); // Probably should not be moving this...
         information = std::move(other.information);
         preloadedData = std::move(other.preloadedData);
+        packedHead = std::move(other.packedHead);
         fileData = std::move(other.fileData);
         preloadCallCount = other.preloadCallCount;
         availableFrames = other.availableFrames.load();
@@ -101,6 +134,7 @@ struct FileData
         ASSERT(other.readerCount == 0); // Probably should not be moving this...
         information = std::move(other.information);
         preloadedData = std::move(other.preloadedData);
+        packedHead = std::move(other.packedHead);
         fileData = std::move(other.fileData);
         preloadCallCount = other.preloadCallCount;
         availableFrames = other.availableFrames.load();
@@ -109,7 +143,8 @@ struct FileData
         return *this;
     }
 
-    FileAudioBuffer preloadedData;
+    FileAudioBuffer preloadedData;      // float head; empty when the head is packed
+    PackedHeadBuffer packedHead;        // 16-bit head (setHead)
     FileInformation information;
     FileAudioBuffer fileData {};
     int preloadCallCount { 0 };

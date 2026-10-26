@@ -36,6 +36,7 @@
 #include <absl/strings/match.h>
 #include <absl/memory/memory.h>
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <thread>
 #include <system_error>
@@ -162,6 +163,73 @@ sfz::FileAudioBuffer readFromFile(sfz::AudioReader& reader, uint32_t numFrames)
     sfz::FileAudioBuffer baseBuffer;
     readBaseFile(reader, baseBuffer, numFrames);
     return baseBuffer;
+}
+
+// The 16-bit values of a float head, or false when a sample is not one (a 24-bit or float
+// recording): then the head stays float, as before. Multiplying by 32768 is exact in
+// float, so the test is exact, and so is the way back (kPackedHeadScale).
+static bool packHead(const sfz::FileAudioBuffer& head, sfz::PackedHeadBuffer& out)
+{
+    const size_t numFrames = head.getNumFrames();
+    const size_t numChannels = head.getNumChannels();
+    if (numFrames == 0 || numChannels == 0)
+        return false;
+    for (size_t c = 0; c < numChannels; ++c) {
+        for (float v : head.getConstSpan(c)) {
+            const float k = v * 32768.0f;
+            if (!(k >= -32768.0f && k <= 32767.0f) || k != std::nearbyint(k))
+                return false;
+        }
+    }
+    out.reset();
+    out.resize(numFrames);
+    for (size_t c = 0; c < numChannels; ++c)
+        out.addChannel();
+    out.clear();
+    for (size_t c = 0; c < numChannels; ++c) {
+        const auto from = head.getConstSpan(c);
+        const auto to = out.getSpan(c);
+        for (size_t i = 0; i < numFrames; ++i)
+            to[i] = static_cast<int16_t>(from[i] * 32768.0f);
+    }
+    return true;
+}
+
+// On by default. Off keeps every head float, as before: the A/B for the null test and the
+// render cost. Read when a head is set, so a change applies from the next load.
+static std::atomic<bool> packHeads { true };
+extern "C" void sfizz_set_packed_heads(int on)
+{
+    packHeads.store(on != 0, std::memory_order_relaxed);
+}
+
+// Heads set since the last reset, packed and kept float: the check that packing happens
+// (a null test passes trivially if it never does) and the log line of each load.
+static std::atomic<int> headsPacked { 0 };
+static std::atomic<int> headsFloat { 0 };
+extern "C" void sfizz_head_counts(int* packed, int* floats)
+{
+    if (packed) *packed = headsPacked.load(std::memory_order_relaxed);
+    if (floats) *floats = headsFloat.load(std::memory_order_relaxed);
+}
+extern "C" void sfizz_head_counts_reset()
+{
+    headsPacked.store(0, std::memory_order_relaxed);
+    headsFloat.store(0, std::memory_order_relaxed);
+}
+
+void sfz::FileData::setHead(FileAudioBuffer&& head) noexcept
+{
+    PackedHeadBuffer packed;
+    if (packHeads.load(std::memory_order_relaxed) && !information.wavetable && packHead(head, packed)) {
+        packedHead = std::move(packed);
+        preloadedData.reset();
+        headsPacked.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        packedHead.reset();
+        preloadedData = std::move(head);
+        headsFloat.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void streamFromFile(sfz::AudioReader& reader, sfz::FileAudioBuffer& output, std::atomic<size_t>* filledFrames = nullptr)
@@ -400,18 +468,19 @@ bool sfz::FilePool::preloadFile(const FileId& fileId, uint32_t maxOffset) noexce
     const auto existingFile = preloadedFiles.find(fileId);
     if (existingFile != preloadedFiles.end()) {
         auto& fileData = existingFile->second;
-        if (framesToLoad > fileData.preloadedData.getNumFrames()) {
+        if (framesToLoad > fileData.headFrames()) {
             fileData.information.maxOffset = maxOffset;
-            fileData.preloadedData = readFromFile(*reader, framesToLoad);
+            fileData.setHead(readFromFile(*reader, framesToLoad));
             fileData.fullyLoaded = frames == framesToLoad;
         }
         fileData.preloadCallCount++;
     } else {
         fileInformation->sampleRate = static_cast<double>(reader->sampleRate());
         auto insertedPair = preloadedFiles.insert_or_assign(fileId, {
-            readFromFile(*reader, framesToLoad),
+            FileAudioBuffer {},
             *fileInformation
         });
+        insertedPair.first->second.setHead(readFromFile(*reader, framesToLoad));
 
         insertedPair.first->second.preloadCallCount++;
         insertedPair.first->second.status = FileData::Status::Preloaded;
@@ -455,7 +524,7 @@ void sfz::FilePool::preloadFiles(const std::vector<std::pair<FileId, uint32_t>>&
         const FileId* id;
         uint32_t maxOffset;
         absl::optional<FileInformation> information;
-        FileAudioBuffer data;
+        FileData data;          // the head set in the worker (setHead packs it there)
         bool fullyLoaded { false };
         bool ok { false };
     };
@@ -466,7 +535,9 @@ void sfz::FilePool::preloadFiles(const std::vector<std::pair<FileId, uint32_t>>&
             preloadFile(item.first, item.second);
             preloadProgressDone.fetch_add(1, std::memory_order_relaxed);
         } else {
-            jobs.push_back(PreloadJob { &item.first, item.second, {}, {}, false, false });
+            jobs.emplace_back();
+            jobs.back().id = &item.first;
+            jobs.back().maxOffset = item.second;
         }
     }
 
@@ -495,7 +566,8 @@ void sfz::FilePool::preloadFiles(const std::vector<std::pair<FileId, uint32_t>>&
                         const auto frames = static_cast<uint32_t>(reader->frames());
                         const auto framesToLoad = loadInRam
                             ? frames : min(frames, job.maxOffset + preloadSize);
-                        job.data = readFromFile(*reader, framesToLoad);
+                        job.data.information = *information;
+                        job.data.setHead(readFromFile(*reader, framesToLoad));
                         job.fullyLoaded = framesToLoad == frames;
                         job.information = information;
                         job.ok = true;
@@ -521,8 +593,7 @@ void sfz::FilePool::preloadFiles(const std::vector<std::pair<FileId, uint32_t>>&
     for (PreloadJob& job : jobs) {
         if (!job.ok)
             continue;
-        auto insertedPair = preloadedFiles.insert_or_assign(*job.id,
-            FileData(std::move(job.data), *job.information));
+        auto insertedPair = preloadedFiles.insert_or_assign(*job.id, std::move(job.data));
         insertedPair.first->second.preloadCallCount++;
         insertedPair.first->second.status = FileData::Status::Preloaded;
         insertedPair.first->second.fullyLoaded = job.fullyLoaded;
@@ -656,7 +727,7 @@ void sfz::FilePool::setPreloadSize(uint32_t preloadSize) noexcept
         AudioReaderPtr reader = createAudioReader(file, fileId.isReverse());
         const auto frames = reader->frames();
         const auto framesToLoad = min(frames, maxOffset + preloadSize);
-        fileData.preloadedData = readFromFile(*reader, static_cast<uint32_t>(framesToLoad));
+        fileData.setHead(readFromFile(*reader, static_cast<uint32_t>(framesToLoad)));
         fileData.fullyLoaded = frames == framesToLoad;
     }
 }
@@ -831,10 +902,10 @@ void sfz::FilePool::setRamLoading(bool loadInRam) noexcept
             fs::path file { rootDirectory / preloadedFile.first.filename() };
             AudioReaderPtr reader = createAudioReader(file, preloadedFile.first.isReverse());
             auto& fileData = preloadedFile.second;
-            fileData.preloadedData = readFromFile(
+            fileData.setHead(readFromFile(
                 *reader,
                 fileData.information.end
-            );
+            ));
             fileData.fullyLoaded = true;
         }
     } else {
