@@ -50,6 +50,74 @@ using namespace std::placeholders;
 static std::weak_ptr<ThreadPool> globalThreadPoolWeakPtr;
 static std::mutex globalThreadPoolMutex;
 
+static unsigned decodeThreadCount()
+{
+    unsigned numThreads = std::thread::hardware_concurrency();
+    return (numThreads > 2) ? (numThreads - 2) : 1;
+}
+
+// ---- Decode speed (organdroid patch, STREAMING_SAFETY_DESIGN.md §5) ----
+// The app learns how fast this device decodes a pipe from what it already does: the
+// parallel preload (head frames, the time each worker spent, the wall time) and every
+// stream (whole-file frames, the time from opening the file to the last frame). Worker
+// threads write, the app reads; nothing here runs on the audio thread. Stream timings are
+// kept in a small buffer the app drains; when it is full the oldest go.
+
+namespace {
+struct DecodeTiming { uint32_t frames; uint32_t micros; };
+constexpr size_t kMaxStreamTimings = 256;
+std::mutex streamTimingsMutex;
+std::vector<DecodeTiming> streamTimings;
+
+std::atomic<uint64_t> preloadTimedFrames { 0 };
+std::atomic<uint64_t> preloadThreadMicros { 0 };
+std::atomic<uint64_t> preloadWallMicros { 0 };
+std::atomic<int> preloadThreads { 0 };
+
+uint64_t microsSince(std::chrono::steady_clock::time_point start)
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start).count());
+}
+
+void recordStreamTiming(uint64_t frames, uint64_t micros)
+{
+    std::lock_guard<std::mutex> lock { streamTimingsMutex };
+    if (streamTimings.size() >= kMaxStreamTimings)
+        streamTimings.erase(streamTimings.begin());
+    streamTimings.push_back({ static_cast<uint32_t>(frames), static_cast<uint32_t>(std::min<uint64_t>(micros, UINT32_MAX)) });
+}
+} // namespace
+
+// The last cold preload: head frames decoded, worker time summed over jobs, wall time,
+// workers. Zero until a preload decoded something.
+extern "C" void sfizz_preload_timing(uint64_t* frames, uint64_t* threadMicros, uint64_t* wallMicros, int* threads)
+{
+    if (frames)       *frames       = preloadTimedFrames.load(std::memory_order_relaxed);
+    if (threadMicros) *threadMicros = preloadThreadMicros.load(std::memory_order_relaxed);
+    if (wallMicros)   *wallMicros   = preloadWallMicros.load(std::memory_order_relaxed);
+    if (threads)      *threads      = preloadThreads.load(std::memory_order_relaxed);
+}
+
+// Moves up to max stream timings (oldest first) into the arrays; returns how many.
+extern "C" int sfizz_stream_timings(uint32_t* frames, uint32_t* micros, int max)
+{
+    std::lock_guard<std::mutex> lock { streamTimingsMutex };
+    const int n = std::min<int>(max, static_cast<int>(streamTimings.size()));
+    for (int i = 0; i < n; ++i) {
+        frames[i] = streamTimings[i].frames;
+        micros[i] = streamTimings[i].micros;
+    }
+    streamTimings.erase(streamTimings.begin(), streamTimings.begin() + n);
+    return n;
+}
+
+// Threads that serve streams (and decode the preload): the same count for both.
+extern "C" int sfizz_decode_threads()
+{
+    return static_cast<int>(decodeThreadCount());
+}
+
 static std::shared_ptr<ThreadPool> globalThreadPool()
 {
     std::shared_ptr<ThreadPool> threadPool;
@@ -63,9 +131,7 @@ static std::shared_ptr<ThreadPool> globalThreadPool()
     if (threadPool)
         return threadPool;
 
-    unsigned numThreads = std::thread::hardware_concurrency();
-    numThreads = (numThreads > 2) ? (numThreads - 2) : 1;
-    threadPool.reset(new ThreadPool(numThreads));
+    threadPool.reset(new ThreadPool(decodeThreadCount()));
     globalThreadPoolWeakPtr = threadPool;
     return threadPool;
 }
@@ -408,13 +474,16 @@ void sfz::FilePool::preloadFiles(const std::vector<std::pair<FileId, uint32_t>>&
         // A dedicated pool, NOT the shared streaming pool: a still-audible synth (the old
         // palette during a hot-swap) streams through that pool, and its jobs must not
         // queue behind thousands of decode jobs.
-        unsigned numThreads = std::thread::hardware_concurrency();
-        numThreads = (numThreads > 2) ? (numThreads - 2) : 1;
+        const unsigned numThreads = decodeThreadCount();
         ThreadPool pool { numThreads };
         std::vector<std::future<void>> futures;
         futures.reserve(jobs.size());
+        std::atomic<uint64_t> framesDecoded { 0 };
+        std::atomic<uint64_t> workerMicros { 0 };
+        const auto wallStart = std::chrono::steady_clock::now();
         for (PreloadJob& job : jobs) {
-            futures.push_back(pool.enqueue([this, &job] {
+            futures.push_back(pool.enqueue([this, &job, &framesDecoded, &workerMicros] {
+                const auto jobStart = std::chrono::steady_clock::now();
                 const fs::path file { rootDirectory / job.id->filename() };
                 std::error_code ec;
                 if (fs::exists(file, ec)) {
@@ -430,13 +499,23 @@ void sfz::FilePool::preloadFiles(const std::vector<std::pair<FileId, uint32_t>>&
                         job.fullyLoaded = framesToLoad == frames;
                         job.information = information;
                         job.ok = true;
+                        framesDecoded.fetch_add(framesToLoad, std::memory_order_relaxed);
                     }
                 }
+                workerMicros.fetch_add(microsSince(jobStart), std::memory_order_relaxed);
                 preloadProgressDone.fetch_add(1, std::memory_order_relaxed);
             }));
         }
         for (auto& f : futures)
             f.wait();
+        // Only a preload that decoded files replaces the last timing (a reload of files
+        // already held decodes nothing).
+        if (framesDecoded.load() > 0) {
+            preloadTimedFrames.store(framesDecoded.load(), std::memory_order_relaxed);
+            preloadThreadMicros.store(workerMicros.load(), std::memory_order_relaxed);
+            preloadWallMicros.store(microsSince(wallStart), std::memory_order_relaxed);
+            preloadThreads.store(static_cast<int>(numThreads), std::memory_order_relaxed);
+        }
     }
 
     for (PreloadJob& job : jobs) {
@@ -592,6 +671,7 @@ void sfz::FilePool::loadingJob(const QueuedFileData& data) noexcept
         return;
     }
 
+    const auto jobStart = std::chrono::steady_clock::now();
     const fs::path file { rootDirectory / id->filename() };
     std::error_code readError;
     AudioReaderPtr reader = createAudioReader(file, id->isReverse(), &readError);
@@ -638,6 +718,9 @@ void sfz::FilePool::loadingJob(const QueuedFileData& data) noexcept
     streamFromFile(*reader, data.data->fileData, &data.data->availableFrames);
 
     data.data->status = FileData::Status::Done;
+    // Opening included: a stream pays it too. The wait for the Preloaded state is
+    // normally nothing and is counted with it.
+    recordStreamTiming(data.data->availableFrames.load(), microsSince(jobStart));
 
     std::lock_guard<SpinMutex> guard { garbageAndLastUsedMutex };
     if (absl::c_find(lastUsedFiles, *id) == lastUsedFiles.end())
