@@ -40,6 +40,9 @@ public:
     virtual unsigned channels() const = 0;
     virtual unsigned sampleRate() const = 0;
     virtual size_t readNextBlock(float* buffer, size_t frames) = 0;
+    // organdroid: move to a frame, so a stream can start after the preloaded head.
+    // Forward readers only; false means the reader cannot, and reads from where it is.
+    virtual bool seek(uint64_t frame) { (void)frame; return false; }
     virtual bool getInstrumentInfo(InstrumentInfo&) { return false; };
     virtual bool getWavetableInfo(WavetableInfo&) { return false; };
 };

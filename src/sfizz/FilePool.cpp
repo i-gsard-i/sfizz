@@ -60,7 +60,7 @@ static unsigned decodeThreadCount()
 // ---- Decode speed (organdroid patch, STREAMING_SAFETY_DESIGN.md §5) ----
 // The app learns how fast this device decodes a pipe from what it already does: the
 // parallel preload (head frames, the time each worker spent, the wall time) and every
-// stream (whole-file frames, the time from opening the file to the last frame). Worker
+// stream (frames decoded, the time its chunks took, opening included). Worker
 // threads write, the app reads; nothing here runs on the audio thread. Stream timings are
 // kept in a small buffer the app drains; when it is full the oldest go.
 
@@ -272,54 +272,11 @@ void sfz::FileData::setHead(FileAudioBuffer&& head) noexcept
     }
 }
 
-void streamFromFile(sfz::AudioReader& reader, sfz::FileAudioBuffer& output, std::atomic<size_t>* filledFrames = nullptr)
-{
-    const auto numFrames = static_cast<size_t>(reader.frames());
-    const auto numChannels = reader.channels();
-    const auto chunkSize = static_cast<size_t>(sfz::config::fileChunkSize);
-
-    output.reset();
-    output.addChannels(reader.channels());
-    output.resize(numFrames);
-    output.clear();
-
-    sfz::Buffer<float> fileBlock { chunkSize * numChannels };
-    size_t inputFrameCounter { 0 };
-    size_t outputFrameCounter { 0 };
-    bool inputEof = false;
-
-    while (!inputEof && inputFrameCounter < numFrames)
-    {
-        auto thisChunkSize = std::min(chunkSize, numFrames - inputFrameCounter);
-        const auto numFramesRead = static_cast<size_t>(
-            reader.readNextBlock(fileBlock.data(), thisChunkSize));
-        if (numFramesRead == 0)
-            break;
-
-        if (numFramesRead < thisChunkSize) {
-            inputEof = true;
-            thisChunkSize = numFramesRead;
-        }
-        const auto outputChunkSize = thisChunkSize;
-
-        for (size_t chanIdx = 0; chanIdx < numChannels; chanIdx++) {
-            const auto outputChunk = output.getSpan(chanIdx).subspan(outputFrameCounter, outputChunkSize);
-            for (size_t i = 0; i < thisChunkSize; ++i)
-                outputChunk[i] = fileBlock[i * numChannels + chanIdx];
-        }
-        inputFrameCounter += thisChunkSize;
-        outputFrameCounter += outputChunkSize;
-
-        if (filledFrames != nullptr)
-            filledFrames->fetch_add(outputChunkSize);
-    }
-}
-
 sfz::FilePool::FilePool()
     : filesToLoad(alignedNew<FileQueue>()),
       threadPool(globalThreadPool())
 {
-    loadingJobs.reserve(config::maxVoices);
+    activeStreams.reserve(config::maxVoices);
     lastUsedFiles.reserve(config::maxVoices);
     garbageToCollect.reserve(config::maxVoices);
 }
@@ -336,8 +293,10 @@ sfz::FilePool::~FilePool()
     dispatchBarrier.post(ec);
     dispatchThread.join();
 
-    for (auto& job : loadingJobs)
-        job.wait();
+    // Every task holds `this`: cancel the streams and wait until the last task is gone.
+    streamsCancelled = true;
+    while (streamTasks.load() > 0)
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
 }
 
 bool sfz::FilePool::checkSample(std::string& filename) const noexcept
@@ -729,7 +688,7 @@ sfz::FileDataHolder sfz::FilePool::getFilePromise(const std::shared_ptr<FileId>&
     auto& fileData = preloaded->second;
     // organdroid: queue the stream only when nobody has yet. An organ chord strikes the
     // same files over and over (every stop x every key, then their release tails), and a
-    // job for a file already Streaming/Done returns at once (loadingJob), so those pushes
+    // stream for a file already Streaming/Done is dropped at once (startStream), so those pushes
     // only filled the 256-slot queue; a full queue then refused the voice outright.
     const auto status = fileData.status.load();
     const bool needsStream = status == FileData::Status::Preloaded
@@ -744,6 +703,7 @@ sfz::FileDataHolder sfz::FilePool::getFilePromise(const std::shared_ptr<FileId>&
             return { &preloaded->second };
         }
 
+        pendingStreams.fetch_add(1);
         std::error_code ec;
         dispatchBarrier.post(ec);
         ASSERT(!ec);
@@ -772,72 +732,245 @@ void sfz::FilePool::setPreloadSize(uint32_t preloadSize) noexcept
     }
 }
 
-void sfz::FilePool::loadingJob(const QueuedFileData& data) noexcept
+// ---- Streaming (organdroid, STREAMING_SAFETY_DESIGN.md 4a) ----
+// sfizz decoded each file whole, from frame 0, one job per file, first in first out: a file
+// queued behind others waited for all of them to be decoded to their ends, and a burst of
+// stops queued many at once. Now a stream starts where the preloaded head ends (the head
+// is copied in, not decoded again) and is decoded kStreamChunkFrames at a time; each task
+// takes the stream whose deadline is soonest, the moment its earliest voice reaches the
+// end of what is decoded (taken as playing at the file's own rate from the request on).
+// A pipe then waits for chunks, not for whole files.
+
+namespace {
+// 170 ms of a 48 kHz pipe: about 1 ms of decoding on the Galaxy M31 (7-9 M frames/s per
+// thread, tests/STREAMING_PHONE_CHECK_REPORT.md), so an urgent stream waits about that per
+// task ahead of it; the requeue costs microseconds.
+constexpr size_t kStreamChunkFrames { 8192 };
+
+// Off by default. On, every finished stream is compared with the file decoded whole from
+// frame 0 (the old way) and counted: the check that the copied head and the seek are exact.
+std::atomic<bool> verifyStreams { false };
+std::atomic<int> streamsVerified { 0 };
+std::atomic<int> streamsMismatched { 0 };
+// Streams started after a copied head, and from frame 0 (a reader that cannot seek).
+std::atomic<int> streamsFromHead { 0 };
+std::atomic<int> streamsFromZero { 0 };
+} // namespace
+
+extern "C" void sfizz_stream_starts(int* fromHead, int* fromZero)
 {
-    raiseCurrentThreadPriority();
+    if (fromHead) *fromHead = streamsFromHead.load();
+    if (fromZero) *fromZero = streamsFromZero.load();
+}
 
-    std::shared_ptr<FileId> id = data.id.lock();
-    if (!id) {
-        // file ID was nulled, it means the region was deleted, ignore
-        return;
+extern "C" void sfizz_set_stream_verify(int on)
+{
+    verifyStreams.store(on != 0);
+}
+
+extern "C" void sfizz_stream_verify_counts(int* ok, int* bad)
+{
+    if (ok) *ok = streamsVerified.load();
+    if (bad) *bad = streamsMismatched.load();
+}
+
+double sfz::FilePool::streamClock() const noexcept
+{
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - streamEpoch).count();
+}
+
+void sfz::FilePool::enqueueStreamTask() noexcept
+{
+    threadPool->enqueue([this]() { streamChunkTask(); });
+}
+
+void sfz::FilePool::removeStream(ActiveStream* stream) noexcept
+{
+    {
+        std::lock_guard<std::mutex> lock { streamsMutex };
+        const auto it = std::find_if(activeStreams.begin(), activeStreams.end(),
+            [stream](const std::unique_ptr<ActiveStream>& p) { return p.get() == stream; });
+        if (it != activeStreams.end()) {
+            std::iter_swap(it, activeStreams.end() - 1);
+            activeStreams.pop_back();
+        }
     }
+    pendingStreams.fetch_sub(1);
+}
 
-    const auto jobStart = std::chrono::steady_clock::now();
-    const fs::path file { rootDirectory / id->filename() };
+sfz::FilePool::StartResult sfz::FilePool::startStream(ActiveStream& stream) noexcept
+{
+    FileData& data = *stream.data;
+    const auto status = data.status.load();
+    // Invalid: the preload has not published the file yet. GarbageCollecting: the
+    // collector is taking the last stream's buffer. Both pass in moments.
+    if (status == FileData::Status::Invalid || status == FileData::Status::GarbageCollecting)
+        return ++stream.attempts > 1024 ? StartResult::Drop : StartResult::Retry;
+    if (status != FileData::Status::Preloaded)
+        return StartResult::Drop;   // already streamed or streaming
+
+    std::shared_ptr<FileId> id = stream.id.lock();
+    if (!id)
+        return StartResult::Drop;
     std::error_code readError;
-    AudioReaderPtr reader = createAudioReader(file, id->isReverse(), &readError);
-
-    if (readError) {
+    AudioReaderPtr reader = createAudioReader(rootDirectory / id->filename(), id->isReverse(), &readError);
+    if (readError || !reader) {
         DBG("[sfizz] reading the file errored for " << *id << " with code " << readError << ": " << readError.message());
+        return StartResult::Drop;
+    }
+
+    auto expected = FileData::Status::Preloaded;
+    if (!data.status.compare_exchange_strong(expected, FileData::Status::Streaming))
+        return expected == FileData::Status::GarbageCollecting ? StartResult::Retry : StartResult::Drop;
+
+    const auto numFrames = static_cast<size_t>(reader->frames());
+    const unsigned numChannels = reader->channels();
+    FileAudioBuffer& out = data.fileData;
+    out.reset();
+    out.addChannels(numChannels);
+    out.resize(numFrames);
+    out.clear();
+
+    // The head, copied: the same frames this file decodes to (a packed head converts back
+    // exactly), so the decoder starts at its end. A reader that cannot seek starts at 0.
+    size_t head = std::min(data.headFrames(), numFrames);
+    const bool packed = data.packedHead.getNumFrames() > 0;
+    const size_t headChannels = packed ? data.packedHead.getNumChannels() : data.preloadedData.getNumChannels();
+    if (head == 0 || headChannels != numChannels || !reader->seek(head))
+        head = 0;
+    for (size_t c = 0; c < numChannels && head > 0; ++c) {
+        const auto to = out.getSpan(c);
+        if (packed) {
+            const auto from = data.packedHead.getConstSpan(c);
+            for (size_t i = 0; i < head; ++i)
+                to[i] = static_cast<float>(from[i]) * kPackedHeadScale;
+        } else {
+            const auto from = data.preloadedData.getConstSpan(c);
+            std::copy(from.begin(), from.begin() + head, to.begin());
+        }
+    }
+    data.availableFrames.store(head);   // not past the head: voices keep reading the head
+    (head > 0 ? streamsFromHead : streamsFromZero).fetch_add(1);
+
+    stream.reader = std::move(reader);
+    stream.numFrames = numFrames;
+    stream.position = head;
+    stream.sampleRate = stream.reader->sampleRate() > 0 ? stream.reader->sampleRate() : config::defaultSampleRate;
+    stream.deadline = stream.requestedAt + head / stream.sampleRate;
+    stream.started = true;
+    return StartResult::Started;
+}
+
+bool sfz::FilePool::decodeChunk(ActiveStream& stream) noexcept
+{
+    FileData& data = *stream.data;
+    const unsigned numChannels = stream.reader->channels();
+    thread_local sfz::Buffer<float> block;
+    const size_t want = std::min(kStreamChunkFrames, stream.numFrames - stream.position);
+    if (want == 0)
+        return true;
+    if (block.size() < want * numChannels)
+        block.resize(kStreamChunkFrames * std::max(2u, numChannels));
+    const size_t got = stream.reader->readNextBlock(block.data(), want);
+    for (unsigned c = 0; c < numChannels && got > 0; ++c) {
+        const auto to = data.fileData.getSpan(c).subspan(stream.position, got);
+        for (size_t i = 0; i < got; ++i)
+            to[i] = block[i * numChannels + c];
+    }
+    stream.position += got;
+    stream.decodedFrames += got;
+    data.availableFrames.fetch_add(got);
+    stream.deadline = stream.requestedAt + stream.position / stream.sampleRate;
+    return got < want || stream.position >= stream.numFrames;
+}
+
+void sfz::FilePool::finishStream(ActiveStream& stream) noexcept
+{
+    FileData& data = *stream.data;
+    if (verifyStreams.load()) {
+        bool same = false;
+        if (std::shared_ptr<FileId> id = stream.id.lock()) {
+            AudioReaderPtr reader = createAudioReader(rootDirectory / id->filename(), id->isReverse());
+            const FileAudioBuffer whole = readFromFile(*reader, static_cast<uint32_t>(stream.numFrames));
+            const size_t n = data.availableFrames.load();
+            same = whole.getNumFrames() == n && whole.getNumChannels() == data.fileData.getNumChannels();
+            for (size_t c = 0; same && c < whole.getNumChannels(); ++c) {
+                const auto a = whole.getConstSpan(c);
+                const auto b = data.fileData.getConstSpan(c);
+                same = std::equal(a.begin(), a.begin() + n, b.begin());
+            }
+        }
+        (same ? streamsVerified : streamsMismatched).fetch_add(1);
+    }
+
+    data.status = FileData::Status::Done;
+    streamBytes.fetch_add(streamedBytes(data.fileData), std::memory_order_relaxed);
+    streamFiles.fetch_add(1, std::memory_order_relaxed);
+    // What the decode speed means now: frames decoded here over the time the tasks spent
+    // on them, opening included (the head is copied, and waits between chunks are not
+    // decoding).
+    recordStreamTiming(stream.decodedFrames, stream.workMicros);
+
+    if (std::shared_ptr<FileId> id = stream.id.lock()) {
+        std::lock_guard<SpinMutex> guard { garbageAndLastUsedMutex };
+        if (absl::c_find(lastUsedFiles, *id) == lastUsedFiles.end())
+            lastUsedFiles.push_back(*id);
+    }
+}
+
+void sfz::FilePool::streamChunkTask() noexcept
+{
+    thread_local bool prioritySet = false;
+    if (!prioritySet) {
+        raiseCurrentThreadPriority();
+        prioritySet = true;
+    }
+
+    ActiveStream* stream = nullptr;
+    {
+        std::lock_guard<std::mutex> lock { streamsMutex };
+        for (const auto& p : activeStreams)
+            if (!p->busy && (!stream || p->deadline < stream->deadline))
+                stream = p.get();
+        if (stream)
+            stream->busy = true;
+    }
+    if (!stream) {   // cannot happen with one task per stream; stay in the count
+        std::this_thread::yield();
+        enqueueStreamTask();
         return;
     }
 
-    FileData::Status currentStatus;
-
-    unsigned spinCounter { 0 };
-
-    while (1) {
-        currentStatus = data.data->status.load();
-        while (currentStatus == FileData::Status::Invalid) {
-            // Spin until the state changes
-            if (spinCounter > 1024) {
-                DBG("[sfizz] " << *id << " is stuck on Invalid? Leaving the load");
-                return;
-            }
-
+    bool finished = false;
+    bool drop = streamsCancelled.load() || stream->id.expired();
+    const auto start = std::chrono::steady_clock::now();
+    if (!drop && !stream->started) {
+        switch (startStream(*stream)) {
+        case StartResult::Started: break;
+        case StartResult::Drop: drop = true; break;
+        case StartResult::Retry:
             std::this_thread::sleep_for(std::chrono::microseconds(100));
-            currentStatus = data.data->status.load();
-            spinCounter += 1;
-        }
-        // wait for garbage collection
-        if (currentStatus == FileData::Status::GarbageCollecting) {
-            atomic_queue::spin_loop_pause();
-            atomic_queue::spin_loop_pause();
-            atomic_queue::spin_loop_pause();
-            atomic_queue::spin_loop_pause();
-            continue;
-        }
-        // Already loading or loaded
-        if (currentStatus != FileData::Status::Preloaded)
-            return;
-
-        // go outside loop if this gets token
-        if (data.data->status.compare_exchange_strong(currentStatus, FileData::Status::Streaming))
             break;
+        }
     }
+    if (!drop && stream->started)
+        finished = decodeChunk(*stream);
+    stream->workMicros += microsSince(start);
 
-    streamFromFile(*reader, data.data->fileData, &data.data->availableFrames);
-
-    data.data->status = FileData::Status::Done;
-    streamBytes.fetch_add(streamedBytes(data.data->fileData), std::memory_order_relaxed);
-    streamFiles.fetch_add(1, std::memory_order_relaxed);
-    // Opening included: a stream pays it too. The wait for the Preloaded state is
-    // normally nothing and is counted with it.
-    recordStreamTiming(data.data->availableFrames.load(), microsSince(jobStart));
-
-    std::lock_guard<SpinMutex> guard { garbageAndLastUsedMutex };
-    if (absl::c_find(lastUsedFiles, *id) == lastUsedFiles.end())
-        lastUsedFiles.push_back(*id);
+    if (finished)
+        finishStream(*stream);
+    if (finished || drop) {
+        if (drop && stream->started)
+            stream->data->status = FileData::Status::Done;   // what it has stays readable
+        removeStream(stream);
+        streamTasks.fetch_sub(1);
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock { streamsMutex };
+        stream->busy = false;
+    }
+    enqueueStreamTask();
 }
 
 void sfz::FilePool::clear()
@@ -864,22 +997,30 @@ bool is_ready(std::future<R> const& f)
 void sfz::FilePool::dispatchingJob() noexcept
 {
     while (dispatchBarrier.wait(), dispatchFlag) {
-        std::lock_guard<std::mutex> guard { loadingJobsMutex };
-
         QueuedFileData queuedData;
-        if (filesToLoad->try_pop(queuedData)) {
-            if (queuedData.id.expired()) {
-                // file ID was nulled, it means the region was deleted, ignore
-            }
-            else
-                loadingJobs.push_back(
-                    threadPool->enqueue([this](const QueuedFileData& data) { loadingJob(data); }, std::move(queuedData)));
+        if (!filesToLoad->try_pop(queuedData))
+            continue;
+        // A deleted region (its file ID nulled), or a file two voices queued in the same
+        // block: one stream serves every voice.
+        bool skip = queuedData.id.expired();
+        auto stream = std::unique_ptr<ActiveStream>(new ActiveStream);
+        stream->id = queuedData.id;
+        stream->data = queuedData.data;
+        stream->requestedAt = streamClock();
+        stream->deadline = stream->requestedAt;
+        {
+            std::lock_guard<std::mutex> lock { streamsMutex };
+            for (const auto& p : activeStreams)
+                skip = skip || p->data == queuedData.data;
+            if (!skip)
+                activeStreams.push_back(std::move(stream));
         }
-
-        // Clear finished jobs
-        swapAndPopAll(loadingJobs, [](std::future<void>& future) {
-            return is_ready(future);
-        });
+        if (skip) {
+            pendingStreams.fetch_sub(1);
+            continue;
+        }
+        streamTasks.fetch_add(1);
+        enqueueStreamTask();
     }
 }
 
@@ -893,12 +1034,9 @@ void sfz::FilePool::garbageJob() noexcept
 
 void sfz::FilePool::waitForBackgroundLoading() noexcept
 {
-    std::lock_guard<std::mutex> guard { loadingJobsMutex };
-
-    for (auto& job : loadingJobs)
-        job.wait();
-
-    loadingJobs.clear();
+    // Every stream queued so far, to its end (freewheeling renders, clearing the pool).
+    while (pendingStreams.load() > 0)
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
 }
 
 void sfz::FilePool::raiseCurrentThreadPriority() noexcept

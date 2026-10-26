@@ -96,6 +96,7 @@ public:
     explicit ForwardReader(ST_AudioFile handle, std::unique_ptr<MetadataReader> mdReader);
     AudioReaderType type() const override;
     size_t readNextBlock(float* buffer, size_t frames) override;
+    bool seek(uint64_t frame) override { return handle_.seek(frame); }
 };
 
 ForwardReader::ForwardReader(ST_AudioFile handle, std::unique_ptr<MetadataReader> mdReader)

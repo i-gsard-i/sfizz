@@ -31,6 +31,7 @@
 #include "AudioSpan.h"
 #include "FileId.h"
 #include "FileMetadata.h"
+#include "AudioReader.h"
 #include "SIMDHelpers.h"
 #include "SpinMutex.h"
 #include "utility/Timing.h"
@@ -415,9 +416,40 @@ private:
 
     void dispatchingJob() noexcept;
     void garbageJob() noexcept;
-    void loadingJob(const QueuedFileData& data) noexcept;
-    std::mutex loadingJobsMutex;
-    std::vector<std::future<void>> loadingJobs;
+
+    // organdroid: chunked, soonest-first streaming (STREAMING_SAFETY_DESIGN.md 4a). A
+    // stream decodes one chunk per task and goes back to the pool; each task takes the
+    // stream whose earliest voice reaches the end of what is decoded first. One task per
+    // unfinished stream, so a task always finds a stream no other task holds.
+    struct ActiveStream {
+        std::weak_ptr<FileId> id;
+        FileData* data { nullptr };
+        AudioReaderPtr reader;
+        double requestedAt { 0.0 };   // stream clock, s: when its first voice started
+        double deadline { 0.0 };      // stream clock, s: when that voice reaches `position`
+        double sampleRate { config::defaultSampleRate };
+        size_t position { 0 };        // next frame to decode
+        size_t numFrames { 0 };
+        size_t decodedFrames { 0 };   // decoded here (the copied head not counted)
+        uint64_t workMicros { 0 };    // time spent on it by the tasks, opening included
+        int attempts { 0 };
+        bool started { false };
+        bool busy { false };
+    };
+    enum class StartResult { Started, Retry, Drop };
+    void streamChunkTask() noexcept;
+    StartResult startStream(ActiveStream& stream) noexcept;
+    bool decodeChunk(ActiveStream& stream) noexcept;   // true when the file is complete
+    void finishStream(ActiveStream& stream) noexcept;
+    void removeStream(ActiveStream* stream) noexcept;
+    void enqueueStreamTask() noexcept;
+    double streamClock() const noexcept;
+    const std::chrono::steady_clock::time_point streamEpoch { std::chrono::steady_clock::now() };
+    std::mutex streamsMutex;
+    std::vector<std::unique_ptr<ActiveStream>> activeStreams;
+    std::atomic<int> streamTasks { 0 };      // tasks queued or running
+    std::atomic<int> pendingStreams { 0 };   // queued in filesToLoad or active
+    std::atomic<bool> streamsCancelled { false };
     std::thread dispatchThread { &FilePool::dispatchingJob, this };
     std::thread garbageThread { &FilePool::garbageJob, this };
 
