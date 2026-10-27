@@ -140,6 +140,7 @@ set(SFIZZ_SOURCES
     sfizz/Voice.cpp
     sfizz/ReleaseAlign.cpp
     sfizz/DivisionGate.cpp
+    sfizz/ReleasePacing.cpp
     sfizz/Composite.cpp
     sfizz/ScopedFTZ.cpp
     sfizz/MidiState.cpp

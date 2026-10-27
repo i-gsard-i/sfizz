@@ -18,6 +18,7 @@
 #include "RegionSet.h"
 #include "ReleaseAlign.h"
 #include "DivisionGate.h"
+#include "ReleasePacing.h"
 #include "Composite.h"
 #include "Resources.h"
 #include "BufferPool.h"
@@ -53,6 +54,10 @@ namespace sfz {
 
 // unless set to permissive, the loader rejects sfz files with errors
 static constexpr bool loaderParsesPermissively = true;
+
+// Release pacing (ReleasePacing.h), defined before Synth::noteOn
+static void runPacedOffs(Synth& synth, Synth::Impl& impl) noexcept;
+static void flushPacedOffs(Synth& synth, Synth::Impl& impl, int key) noexcept;
 
 Synth::Synth()
 : impl_(new Impl) // NOLINT: (paul) I don't get why clang-tidy complains here
@@ -266,6 +271,7 @@ void Synth::Impl::initEffectBuses()
 
 void Synth::Impl::clear()
 {
+    numPendingOffs_ = numDeferredOffs_ = 0;
     FilePool& filePool = resources_.getFilePool();
     MidiState& midiState = resources_.getMidiState();
 
@@ -1124,6 +1130,8 @@ void Synth::setSampleRate(float sampleRate) noexcept
 void Synth::renderBlock(AudioSpan<float> buffer) noexcept
 {
     Impl& impl = *impl_;
+    if (impl.numPendingOffs_ != 0 || impl.numDeferredOffs_ != 0)
+        runPacedOffs(*this, impl);
     ScopedFTZ ftz;
     auto& callbackBreakdown = impl.callbackBreakdown_;
     impl.resetCallbackBreakdown();
@@ -1288,6 +1296,151 @@ void Synth::renderBlock(AudioSpan<float> buffer) noexcept
     SFIZZ_CHECK(isReasonableAudio(buffer.getConstSpan(1)));
 }
 
+// Release pacing (ReleasePacing.h). A plain note-off, dispatched now, leaving the stops of
+// `defer` (one bit per gate CC) sounding.
+static void pacedPlainOff(Synth& synth, Synth::Impl& impl, const Synth::Impl::PendingOff& p,
+                          const uint64_t defer[2]) noexcept
+{
+    impl.dispatchDeferCc_[0] = defer[0];
+    impl.dispatchDeferCc_[1] = defer[1];
+    impl.pacingDispatch_ = true;
+    sfizz_division_next_mask(p.mask);
+    synth.hdNoteOff(p.delay, p.key, p.velocity);
+    impl.pacingDispatch_ = false;
+    impl.dispatchDeferCc_[0] = impl.dispatchDeferCc_[1] = 0;
+}
+
+// One stop's part of a paced release, as live registration retires a stop.
+static void pacedStopOff(Synth& synth, const Synth::Impl::DeferredOff& d) noexcept
+{
+    sfizz_division_next_mask(d.mask);
+    sfizz_stop_next_filter(d.cc);
+    synth.hdNoteOff(0, d.key, d.velocity);
+}
+
+// The callback's queued note-offs and the stop note-offs now due.
+static void runPacedOffs(Synth& synth, Synth::Impl& impl) noexcept
+{
+    using Impl = Synth::Impl;
+    const ReleasePacingTick tick = releasePacingTick();
+    if (tick.serial != impl.pacingSerial_) {   // a new callback
+        impl.pacingSerial_ = tick.serial;
+        size_t kept = 0;
+        for (size_t i = 0; i < impl.numDeferredOffs_; ++i) {
+            const Impl::DeferredOff d = impl.deferredOffs_[i];
+            if (static_cast<int32_t>(tick.serial - d.due) >= 0)
+                pacedStopOff(synth, d);
+            else
+                impl.deferredOffs_[kept++] = d;
+        }
+        impl.numDeferredOffs_ = kept;
+    }
+    const size_t numPending = impl.numPendingOffs_;
+    if (numPending == 0)
+        return;
+    impl.numPendingOffs_ = 0;
+
+    // The live voices these note-offs release, per stop. Composites go at once: one voice a key.
+    std::array<uint32_t, 128> keyMask {};
+    for (size_t i = 0; i < numPending; ++i)
+        keyMask[impl.pendingOffs_[i].key] |= impl.pendingOffs_[i].mask;
+    std::array<uint16_t, 128> perCc {};
+    int released = 0;
+    impl.voiceManager_.forEachActive([&](Voice& voice) {
+        const TriggerEvent& event = voice.getTriggerEvent();
+        const int cc = voice.getGateCc();
+        if (voice.isFree() || voice.isNoteOff() || event.type != TriggerEventType::NoteOn
+            || voice.getCompositeLayer() != nullptr || cc < 0 || cc >= 128
+            || (voice.getDivisionMask() & keyMask[event.number]) == 0)
+            return;
+        ++perCc[cc];
+        ++released;
+    });
+    std::array<uint8_t, 128> stops {};
+    int numStops = 0;
+    for (int cc = 0; cc < 128; ++cc)
+        if (perCc[cc] != 0)
+            stops[numStops++] = static_cast<uint8_t>(cc);
+
+    // n from the load: the release costs L + m * startCost * L / V, and each of n groups
+    // brings 1/n of the starts
+    const ReleasePacingConfig cfg = releasePacingConfig();
+    int n = 1;
+    const int sounding = static_cast<int>(impl.voiceManager_.getNumActiveVoices());
+    if (cfg.cap > 1 && sfz::releaseAlignEnabled() && released > 0 && sounding > 0 && tick.frames > 0) {
+        const float starts = released * cfg.startCost * tick.load / sounding;
+        const float room = cfg.target - tick.load;
+        n = room > 0.0f ? static_cast<int>(std::ceil(starts / room)) : cfg.cap;
+        n = std::max(1, std::min({ n, cfg.cap, numStops }));
+        if (impl.numDeferredOffs_ + numPending * static_cast<size_t>(numStops) > impl.deferredOffs_.size())
+            n = 1;   // no room to hold them all: as before, at once
+    }
+    releasePacingRecord(n);
+    const uint64_t none[2] { 0, 0 };
+    if (n == 1) {
+        for (size_t i = 0; i < numPending; ++i)
+            pacedPlainOff(synth, impl, impl.pendingOffs_[i], none);
+        return;
+    }
+
+    // Stops into n groups balanced by their voices, the largest first
+    std::sort(stops.begin(), stops.begin() + numStops,
+              [&](uint8_t a, uint8_t b) { return perCc[a] > perCc[b]; });
+    std::array<int, 128> group {};
+    std::array<int, 128> load {};
+    uint64_t defer[2] { 0, 0 };
+    for (int i = 0; i < numStops; ++i) {
+        const int g = static_cast<int>(std::min_element(load.begin(), load.begin() + n) - load.begin());
+        group[stops[i]] = g;
+        load[g] += perCc[stops[i]];
+        if (g > 0)
+            defer[stops[i] >> 6] |= uint64_t { 1 } << (stops[i] & 63);
+    }
+    // One group a crossfade after the last, in whole callbacks
+    const float crossfade = sfz::releaseAlignCrossfade() * impl.sampleRate_;
+    const uint32_t step = static_cast<uint32_t>(std::max(1.0f, std::ceil(crossfade / tick.frames)));
+    for (size_t i = 0; i < numPending; ++i) {
+        const Impl::PendingOff& p = impl.pendingOffs_[i];
+        pacedPlainOff(synth, impl, p, defer);
+        for (int j = 0; j < numStops; ++j) {
+            const int cc = stops[j];
+            if (group[cc] > 0)
+                impl.deferredOffs_[impl.numDeferredOffs_++] =
+                    { p.key, cc, p.mask, p.velocity, tick.serial + step * static_cast<uint32_t>(group[cc]) };
+        }
+    }
+}
+
+// A key struck again: its queued and put-off note-offs now, keeping the note-on's own
+// division mask and stop filter for it.
+static void flushPacedOffs(Synth& synth, Synth::Impl& impl, int key) noexcept
+{
+    using Impl = Synth::Impl;
+    const uint32_t mask = divisionConsumeMask();
+    const int filter = stopConsumeFilter();
+    size_t kept = 0;
+    for (size_t i = 0; i < impl.numDeferredOffs_; ++i) {
+        const Impl::DeferredOff d = impl.deferredOffs_[i];
+        if (d.key == key)
+            pacedStopOff(synth, d);
+        else
+            impl.deferredOffs_[kept++] = d;
+    }
+    impl.numDeferredOffs_ = kept;
+    const uint64_t none[2] { 0, 0 };
+    kept = 0;
+    for (size_t i = 0; i < impl.numPendingOffs_; ++i) {
+        const Impl::PendingOff p = impl.pendingOffs_[i];
+        if (p.key == key)
+            pacedPlainOff(synth, impl, p, none);
+        else
+            impl.pendingOffs_[kept++] = p;
+    }
+    impl.numPendingOffs_ = kept;
+    sfizz_division_next_mask(mask);
+    sfizz_stop_next_filter(filter);
+}
+
 void Synth::noteOn(int delay, int noteNumber, int velocity) noexcept
 {
     const float normalizedVelocity = normalizeVelocity(velocity);
@@ -1300,6 +1453,10 @@ void Synth::hdNoteOn(int delay, int noteNumber, float normalizedVelocity) noexce
     ASSERT(noteNumber >= 0);
     Impl& impl = *impl_;
     ScopedTiming logger { impl.dispatchDuration_, ScopedTiming::Operation::addToDuration };
+
+    // A key struck again while its release is paced: the release goes first, whole
+    if (impl.numPendingOffs_ != 0 || impl.numDeferredOffs_ != 0)
+        flushPacedOffs(*this, impl, noteNumber);
 
     if (impl.lastKeyswitchLists_[noteNumber].empty())
         impl.resources_.getMidiState().noteOnEvent(delay, noteNumber, normalizedVelocity);
@@ -1366,6 +1523,16 @@ void Synth::hdNoteOff(int delay, int noteNumber, float normalizedVelocity) noexc
     // filter (live registration) further narrows a retro release to ONE stop's voices.
     impl.dispatchDivMask_ = divisionConsumeMask();
     impl.dispatchStopCc_ = stopConsumeFilter();
+
+    // Release pacing (ReleasePacing.h): a plain note-off waits for the callback's render,
+    // where the callback's note-offs are decided together.
+    if (impl.dispatchStopCc_ == kStopFilterNone && !impl.pacingDispatch_
+        && releasePacingConfig().cap > 1 && releasePacingTick().serial != 0
+        && impl.numPendingOffs_ < impl.pendingOffs_.size()) {
+        impl.pendingOffs_[impl.numPendingOffs_++] = { delay, noteNumber, impl.dispatchDivMask_, normalizedVelocity };
+        impl.dispatchDivMask_ = kDivisionAll;
+        return;
+    }
 
     // An octave release is not a note-off of the key: the rows' own note-offs follow it.
     if (impl.lastKeyswitchLists_[noteNumber].empty() && impl.dispatchStopCc_ != kStopFilterOctave)
@@ -1498,8 +1665,10 @@ void Synth::hdNoteOff(int delay, int noteNumber, float normalizedVelocity) noexc
     }
 
     impl.voiceManager_.forEachActive([&](Voice& voice) {
+        const int cc = voice.getGateCc();
         if ((voice.getDivisionMask() & impl.dispatchDivMask_) != 0
-            && (impl.dispatchStopCc_ < 0 || voice.getGateCc() == impl.dispatchStopCc_))
+            && (impl.dispatchStopCc_ < 0 || cc == impl.dispatchStopCc_)
+            && !(cc >= 0 && ((impl.dispatchDeferCc_[cc >> 6] >> (cc & 63)) & 1u)))   // paced
             voice.registerNoteOff(delay, noteNumber, replacedVelocity);
     });
 
@@ -1963,6 +2132,8 @@ void Synth::Impl::noteOffDispatch(int delay, int noteNumber, float velocity) noe
             continue;
         if (region.gateCc >= 0 && ((dispatchSuppressCc_[region.gateCc >> 6] >> (region.gateCc & 63)) & 1u))
             continue;   // a composite member: its tail is in the summed tail (Composite.h)
+        if (region.gateCc >= 0 && ((dispatchDeferCc_[region.gateCc >> 6] >> (region.gateCc & 63)) & 1u))
+            continue;   // a stop a paced note-off leaves for later (ReleasePacing.h)
         if (layer->registerNoteOff(noteNumber, velocity, randValue)) {
             if (region.trigger == Trigger::release && !region.rtDead && !voiceManager_.playingAttackVoice(&region))
                 continue;
@@ -2849,6 +3020,7 @@ void Synth::allSoundOff() noexcept
     for (auto& voice : impl.voiceManager_)
         voice.reset();
     impl.restrikeMask_.fill(0);
+    impl.numPendingOffs_ = impl.numDeferredOffs_ = 0;
     for (int i = 0; i < impl.numOutputs_; ++i) {
         for (auto& effectBus : impl.getEffectBusesForOutput(i))
             if (effectBus)

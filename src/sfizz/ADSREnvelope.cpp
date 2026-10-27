@@ -184,7 +184,15 @@ void ADSREnvelope::getBlockInternal(absl::Span<Float> output) noexcept
                 while (count < size && (currentValue *= releaseRate) > config::egReleaseThreshold)
                     output[count++] = previousValue = currentValue;
             }
-            if (currentValue <= config::egReleaseThreshold) {
+            if (currentValue <= config::egReleaseThreshold && linearRelease) {
+                // A crossfade into a release tail ends at -80 dB: done there, without the
+                // 50 ms fadeout below, which kept the voice rendering for nothing (a big
+                // release then held the chord and its tails at once for 75 ms, not 25)
+                currentState = State::Done;
+                currentValue = 0;
+                std::fill(output.begin() + count, output.begin() + size, Float(0));
+                count = size;
+            } else if (currentValue <= config::egReleaseThreshold) {
                 currentState = State::Fadeout;
                 currentValue = previousValue;
                 transitionDelta = -max(config::egReleaseThreshold, currentValue)

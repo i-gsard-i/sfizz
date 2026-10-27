@@ -436,6 +436,20 @@ struct Synth::Impl final: public Parser::Listener {
     bool dispatchBesideOctave_ { false };
     uint64_t dispatchRowMembers_[2] {};
 
+    // Release pacing (ReleasePacing.h): the plain note-offs of this callback, decided
+    // together at its render, and the per-stop note-offs put off to a later callback.
+    struct PendingOff { int delay; int key; uint32_t mask; float velocity; };
+    struct DeferredOff { int key; int cc; uint32_t mask; float velocity; uint32_t due; };
+    std::array<PendingOff, 128> pendingOffs_ {};
+    size_t numPendingOffs_ { 0 };
+    std::array<DeferredOff, 1024> deferredOffs_ {};
+    size_t numDeferredOffs_ { 0 };
+    uint32_t pacingSerial_ { 0 };
+    bool pacingDispatch_ { false };   // a paced note-off dispatching: not queued again
+    // Set while a paced note-off dispatches: the stops (one bit per gate CC) it leaves
+    // sounding, their voices and tails, for a later per-stop note-off.
+    uint64_t dispatchDeferCc_[2] {};
+
     // organdroid: counted in frames, not read from highResNow(), which SFIZZ_NO_TIMING
     // makes a constant: with it the collector never ran (2026-10-09 to 10-26).
     size_t framesSinceGarbageCollection_ { 0 };
