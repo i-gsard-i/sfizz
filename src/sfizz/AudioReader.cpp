@@ -25,6 +25,7 @@ public:
     int64_t frames() const override;
     unsigned channels() const override;
     unsigned sampleRate() const override;
+    unsigned bitsPerSample() const override { return handle_.get_bits_per_sample(); }
     bool getInstrumentInfo(InstrumentInfo& instrument) override;
     bool getWavetableInfo(WavetableInfo& instrument) override;
 protected:

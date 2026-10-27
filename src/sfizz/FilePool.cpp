@@ -139,9 +139,10 @@ std::atomic<int> gcPending { 0 };
 std::atomic<int> gcDue { 0 };          // passes the Synth asked for
 std::atomic<int> gcLockMissed { 0 };   // of those, skipped: the collector's lock was held
 
-int64_t streamedBytes(const sfz::FileAudioBuffer& b)
+int64_t streamedBytes(const sfz::FileData& d)
 {
-    return static_cast<int64_t>(b.getNumFrames() * b.getNumChannels() * sizeof(float));
+    return static_cast<int64_t>(d.fileData.getNumFrames() * d.fileData.getNumChannels() * sizeof(float)
+        + d.packedTail.getNumFrames() * d.packedTail.getNumChannels() * sizeof(int16_t));
 }
 } // namespace
 
@@ -348,6 +349,7 @@ sfz::FilePool::FilePool()
     lastUsedFiles.reserve(config::maxVoices);
     gcCandidates.reserve(config::maxVoices);
     garbageToCollect.reserve(config::maxVoices);
+    packedGarbage.reserve(config::maxVoices);
 }
 
 sfz::FilePool::~FilePool()
@@ -848,7 +850,24 @@ std::atomic<int> streamsMismatched { 0 };
 // Streams started after a copied head, and from frame 0 (a reader that cannot seek).
 std::atomic<int> streamsFromHead { 0 };
 std::atomic<int> streamsFromZero { 0 };
+
+// On by default. A stream of a 16-bit file after a packed head keeps only the frames past
+// the head, packed as the head is: half the float copy per frame, and nothing for the
+// head. Off streams every file as floats, as before: the A/B for the null test.
+std::atomic<bool> packStreams { true };
+std::atomic<int> streamsPacked { 0 };
 } // namespace
+
+extern "C" void sfizz_set_packed_streams(int on)
+{
+    packStreams.store(on != 0);
+}
+
+// Streams started with a packed tail since the start.
+extern "C" int sfizz_streams_packed()
+{
+    return streamsPacked.load();
+}
 
 extern "C" void sfizz_stream_starts(int* fromHead, int* fromZero)
 {
@@ -918,20 +937,40 @@ sfz::FilePool::StartResult sfz::FilePool::startStream(ActiveStream& stream) noex
 
     const auto numFrames = static_cast<size_t>(reader->frames());
     const unsigned numChannels = reader->channels();
-    FileAudioBuffer& out = data.fileData;
-    out.reset();
-    out.addChannels(numChannels);
-    out.resize(numFrames);
-    out.clear();
 
-    // The head, copied: the same frames this file decodes to (a packed head converts back
-    // exactly), so the decoder starts at its end. A reader that cannot seek starts at 0.
+    // The decoder starts where the head ends (a reader that cannot seek, at 0).
     size_t head = std::min(data.headFrames(), numFrames);
     const bool packed = data.packedHead.getNumFrames() > 0;
     const size_t headChannels = packed ? data.packedHead.getNumChannels() : data.preloadedData.getNumChannels();
     if (head == 0 || headChannels != numChannels || !reader->seek(head))
         head = 0;
-    for (size_t c = 0; c < numChannels && head > 0; ++c) {
+
+    // A 16-bit file after a packed head: the frames past it, packed, the head shared. Its
+    // decoded floats are k/32768 like the head's, so packing them is exact.
+    stream.packed = packed && head > 0 && reader->bitsPerSample() == 16 && packStreams.load();
+    if (stream.packed) {
+        PackedHeadBuffer& tail = data.packedTail;
+        tail.reset();
+        tail.addChannels(numChannels);
+        tail.resize(numFrames - head);
+        tail.clear();
+        data.tailStart = head;
+        streamsPacked.fetch_add(1);
+    }
+
+    // Otherwise the whole file as floats, the head copied in: the same frames this file
+    // decodes to (a packed head converts back exactly).
+    FileAudioBuffer& out = data.fileData;
+    if (stream.packed)
+        out.reset();
+    else {
+        data.packedTail.reset();
+        out.reset();
+        out.addChannels(numChannels);
+        out.resize(numFrames);
+        out.clear();
+    }
+    for (size_t c = 0; c < numChannels && head > 0 && !stream.packed; ++c) {
         const auto to = out.getSpan(c);
         if (packed) {
             const auto from = data.packedHead.getConstSpan(c);
@@ -948,6 +987,7 @@ sfz::FilePool::StartResult sfz::FilePool::startStream(ActiveStream& stream) noex
     stream.reader = std::move(reader);
     stream.numFrames = numFrames;
     stream.position = head;
+    stream.tailStart = head;
     stream.sampleRate = stream.reader->sampleRate() > 0 ? stream.reader->sampleRate() : config::defaultSampleRate;
     stream.deadline = stream.startedAt + head / stream.sampleRate;
     stream.started = true;
@@ -966,9 +1006,15 @@ bool sfz::FilePool::decodeChunk(ActiveStream& stream) noexcept
         block.resize(kStreamChunkFrames * std::max(2u, numChannels));
     const size_t got = stream.reader->readNextBlock(block.data(), want);
     for (unsigned c = 0; c < numChannels && got > 0; ++c) {
-        const auto to = data.fileData.getSpan(c).subspan(stream.position, got);
-        for (size_t i = 0; i < got; ++i)
-            to[i] = block[i * numChannels + c];
+        if (stream.packed) {
+            const auto to = data.packedTail.getSpan(c).subspan(stream.position - stream.tailStart, got);
+            for (size_t i = 0; i < got; ++i)
+                to[i] = static_cast<int16_t>(block[i * numChannels + c] * 32768.0f);
+        } else {
+            const auto to = data.fileData.getSpan(c).subspan(stream.position, got);
+            for (size_t i = 0; i < got; ++i)
+                to[i] = block[i * numChannels + c];
+        }
     }
     stream.position += got;
     stream.decodedFrames += got;
@@ -986,18 +1032,28 @@ void sfz::FilePool::finishStream(ActiveStream& stream) noexcept
             AudioReaderPtr reader = createAudioReader(rootDirectory / id->filename(), id->isReverse());
             const FileAudioBuffer whole = readFromFile(*reader, static_cast<uint32_t>(stream.numFrames));
             const size_t n = data.availableFrames.load();
-            same = whole.getNumFrames() == n && whole.getNumChannels() == data.fileData.getNumChannels();
+            const size_t channels = stream.packed ? data.packedTail.getNumChannels() : data.fileData.getNumChannels();
+            same = whole.getNumFrames() == n && whole.getNumChannels() == channels;
             for (size_t c = 0; same && c < whole.getNumChannels(); ++c) {
                 const auto a = whole.getConstSpan(c);
-                const auto b = data.fileData.getConstSpan(c);
-                same = std::equal(a.begin(), a.begin() + n, b.begin());
+                if (!stream.packed) {
+                    const auto b = data.fileData.getConstSpan(c);
+                    same = std::equal(a.begin(), a.begin() + n, b.begin());
+                    continue;
+                }
+                // The head it follows, then the tail, as the voices read them.
+                const size_t h = stream.tailStart;
+                const auto head = data.packedHead.getConstSpan(c);
+                const auto tail = data.packedTail.getConstSpan(c);
+                for (size_t i = 0; same && i < n; ++i)
+                    same = a[i] == static_cast<float>(i < h ? head[i] : tail[i - h]) * kPackedHeadScale;
             }
         }
         (same ? streamsVerified : streamsMismatched).fetch_add(1);
     }
 
     data.status = FileData::Status::Done;
-    streamBytes.fetch_add(streamedBytes(data.fileData), std::memory_order_relaxed);
+    streamBytes.fetch_add(streamedBytes(data), std::memory_order_relaxed);
     streamFiles.fetch_add(1, std::memory_order_relaxed);
     // What the decode speed means now: frames decoded here over the time the tasks spent
     // on them, opening included (the head is copied, and waits between chunks are not
@@ -1078,6 +1134,7 @@ void sfz::FilePool::clear()
     std::lock_guard<SpinMutex> guard { garbageAndLastUsedMutex };
     emptyFileLoadingQueues();
     garbageToCollect.clear();
+    packedGarbage.clear();
     lastUsedFiles.clear();
     preloadedFiles.clear();
     loadedFiles.clear();
@@ -1131,6 +1188,7 @@ void sfz::FilePool::garbageJob() noexcept
     while (semGarbageBarrier.wait(), garbageFlag) {
         std::lock_guard<SpinMutex> guard { garbageAndLastUsedMutex };
         garbageToCollect.clear();
+        packedGarbage.clear();
     }
 }
 
@@ -1230,13 +1288,15 @@ void sfz::FilePool::collectOverBudget(int64_t budget, int& keptReading, int& kep
                 data->status = FileData::Status::Done;
                 continue;
             }
-            const int64_t bytes = streamedBytes(data->fileData);
+            const int64_t bytes = streamedBytes(*data);
             data->availableFrames = 0;
             streamBytes.fetch_sub(bytes, std::memory_order_relaxed);
             streamFiles.fetch_sub(1, std::memory_order_relaxed);
             over -= bytes;
             ++freed;
             garbageToCollect.push_back(std::move(data->fileData));
+            packedGarbage.push_back(std::move(data->packedTail));
+            data->packedTail.reset();   // a moved-from buffer keeps its sizes
             data->status = FileData::Status::Preloaded;
         }
     }
@@ -1307,10 +1367,12 @@ void sfz::FilePool::triggerGarbageCollection() noexcept
             auto readerCount = data.readerCount.load();
             if (readerCount == 0) {
                 data.availableFrames = 0;
-                streamBytes.fetch_sub(streamedBytes(data.fileData), std::memory_order_relaxed);
+                streamBytes.fetch_sub(streamedBytes(data), std::memory_order_relaxed);
                 streamFiles.fetch_sub(1, std::memory_order_relaxed);
                 ++freed;
                 garbageToCollect.push_back(std::move(data.fileData));
+                packedGarbage.push_back(std::move(data.packedTail));
+                data.packedTail.reset();
                 data.status = FileData::Status::Preloaded;
                 return true;
             }

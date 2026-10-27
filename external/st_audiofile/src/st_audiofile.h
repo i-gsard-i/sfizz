@@ -47,6 +47,8 @@ const char* st_type_string(int type);
 uint32_t st_get_channels(st_audio_file* af);
 float st_get_sample_rate(st_audio_file* af);
 uint64_t st_get_frame_count(st_audio_file* af);
+// organdroid: bits of an integer PCM file (WAV, FLAC), 0 when unknown or not integer.
+uint32_t st_get_bits_per_sample(st_audio_file* af);
 bool st_seek(st_audio_file* af, uint64_t frame);
 uint64_t st_read_s16(st_audio_file* af, int16_t* buffer, uint64_t count);
 uint64_t st_read_f32(st_audio_file* af, float* buffer, uint64_t count);

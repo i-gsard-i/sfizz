@@ -33,6 +33,7 @@ public:
     uint32_t get_channels() const noexcept;
     float get_sample_rate() const noexcept;
     uint64_t get_frame_count() const noexcept;
+    uint32_t get_bits_per_sample() const noexcept;
 
     bool seek(uint64_t frame) noexcept;
     uint64_t read_s16(int16_t* buffer, uint64_t count) noexcept;
@@ -141,6 +142,11 @@ inline float ST_AudioFile::get_sample_rate() const noexcept
 inline uint64_t ST_AudioFile::get_frame_count() const noexcept
 {
     return st_get_frame_count(af_);
+}
+
+inline uint32_t ST_AudioFile::get_bits_per_sample() const noexcept
+{
+    return st_get_bits_per_sample(af_);
 }
 
 inline bool ST_AudioFile::seek(uint64_t frame) noexcept

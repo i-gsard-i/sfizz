@@ -401,6 +401,17 @@ uint32_t st_get_channels(st_audio_file* af)
     return channels;
 }
 
+uint32_t st_get_bits_per_sample(st_audio_file* af)
+{
+    switch (af->type) {
+    case st_audio_file_wav:
+        return af->wav->translatedFormatTag == DR_WAVE_FORMAT_PCM ? af->wav->bitsPerSample : 0;
+    case st_audio_file_flac:
+        return af->flac->bitsPerSample;
+    }
+    return 0;
+}
+
 float st_get_sample_rate(st_audio_file* af)
 {
     float sample_rate = 0;

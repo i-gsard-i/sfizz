@@ -172,6 +172,17 @@ uint32_t st_get_channels(st_audio_file* af)
     return af->info.channels;
 }
 
+uint32_t st_get_bits_per_sample(st_audio_file* af)
+{
+    switch (af->info.format & SF_FORMAT_SUBMASK) {
+    case SF_FORMAT_PCM_S8: case SF_FORMAT_PCM_U8: return 8;
+    case SF_FORMAT_PCM_16: return 16;
+    case SF_FORMAT_PCM_24: return 24;
+    case SF_FORMAT_PCM_32: return 32;
+    }
+    return 0;
+}
+
 float st_get_sample_rate(st_audio_file* af)
 {
     return af->info.samplerate;

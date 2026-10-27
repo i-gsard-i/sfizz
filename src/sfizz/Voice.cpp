@@ -1335,6 +1335,29 @@ int Voice::Impl::starveShiftFor(int first, int last, int limit) noexcept
     return shift;
 }
 
+// Frames from..from+count of a packed source's channel c, as floats: the head, then the
+// tail past tailStart (a streamed file), each with its padding; zeros outside, as the
+// padding holds.
+static void unpackFrames(const FileSource& source, size_t c, int from, int count, float* out) noexcept
+{
+    const int first = -int(PackedHeadBuffer::PaddingLeft);
+    const int last = int(source.getNumFrames() + PackedHeadBuffer::PaddingRight);
+    const int split = source.hasTail() ? int(source.tailStart) : last;
+    const int16_t* head = source.packed.getConstSpan(c).data();
+    const int16_t* tail = source.hasTail() ? source.tail.getConstSpan(c).data() : nullptr;
+    const int end = from + count;
+    const auto clampTo = [&](int idx) { return std::min(std::max(idx, from), end); };
+    const int a = clampTo(first), b = clampTo(split), e = clampTo(last);
+    for (int idx = from; idx < a; ++idx)
+        out[idx - from] = 0.0f;
+    for (int idx = a; idx < b; ++idx)
+        out[idx - from] = float(head[idx]) * kPackedHeadScale;
+    for (int idx = b; idx < e; ++idx)
+        out[idx - from] = float(tail[idx - split]) * kPackedHeadScale;
+    for (int idx = e; idx < end; ++idx)
+        out[idx - from] = 0.0f;
+}
+
 void Voice::Impl::fillWithData(AudioSpan<float> buffer) noexcept
 {
     const size_t numSamples = buffer.getNumFrames();
@@ -1597,11 +1620,9 @@ void Voice::Impl::fillWithData(AudioSpan<float> buffer) noexcept
         if (wholeFrames) {
             for (size_t c = 0; c < source.getNumChannels(); ++c) {   // a mono source fills left only, as the interpolator does
                 float* to = ptBuffer.getSpan(c).data();
-                if (source.isPacked()) {
-                    const int16_t* from = source.packed.getConstSpan(c).data() + ptIndices[0];
-                    for (size_t k = 0; k < ptSize; ++k)
-                        to[k] = float(from[k]) * kPackedHeadScale;
-                } else {
+                if (source.isPacked())
+                    unpackFrames(source, c, ptIndices[0], int(ptSize), to);
+                else {
                     const float* from = source.data.getConstSpan(c).data() + ptIndices[0];
                     std::copy(from, from + ptSize, to);
                 }
@@ -1793,14 +1814,13 @@ void Voice::Impl::fillFromSource(
     }
 
     // The interpolators read up to excessFileFrames either side of a position, which the
-    // window keeps as a margin; outside the head and its padding the window holds zeros,
-    // as the padding does.
+    // window keeps as a margin; outside the frames and their padding the window holds
+    // zeros, as the padding does. A streamed file reads the head, then the tail past
+    // tailStart and its padding.
     BufferPool& pool = resources_.getBufferPool();
     constexpr int margin = config::excessFileFrames;
     constexpr int capacity = int(BufferPool::kHeadWindowFrames);
     const int numChannels = int(source.getNumChannels());
-    const int first = -int(PackedHeadBuffer::PaddingLeft);
-    const int last = int(source.packed.getNumFrames() + PackedHeadBuffer::PaddingRight);
     const size_t total = indices.size();
     int* shifted = pool.headWindowIndices();
 
@@ -1825,11 +1845,7 @@ void Voice::Impl::fillFromSource(
         const float* windows[2] { nullptr, nullptr };
         for (int c = 0; c < numChannels; ++c) {
             float* w = pool.headWindow(size_t(c));
-            const int16_t* head = source.packed.getConstSpan(size_t(c)).data();
-            for (int k = 0; k < count; ++k) {
-                const int idx = start + k;
-                w[k] = (idx >= first && idx < last) ? float(head[idx]) * kPackedHeadScale : 0.0f;
-            }
+            unpackFrames(source, size_t(c), start, count, w);
             windows[c] = w;
         }
         for (size_t i = 0; i < n; ++i)

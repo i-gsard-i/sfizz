@@ -70,12 +70,20 @@ bool streamsWithheld() noexcept;
 float streamRequestDelay() noexcept;
 
 // What a voice reads: float frames (the streamed file, or a head that could not be
-// packed) or a packed head. Exactly one of the two holds frames.
+// packed) or a packed head, and after it, when the file is streamed, the packed rest of
+// the file (its frame 0 is the file's frame tailStart). Exactly one of data and packed
+// holds frames.
 struct FileSource {
     AudioSpan<const float> data;
     AudioSpan<const int16_t> packed;
+    AudioSpan<const int16_t> tail;
+    size_t tailStart { 0 };
     bool isPacked() const noexcept { return packed.getNumFrames() > 0; }
-    size_t getNumFrames() const noexcept { return isPacked() ? packed.getNumFrames() : data.getNumFrames(); }
+    bool hasTail() const noexcept { return tail.getNumFrames() > 0; }
+    size_t getNumFrames() const noexcept
+    {
+        return isPacked() ? (hasTail() ? tailStart + tail.getNumFrames() : packed.getNumFrames()) : data.getNumFrames();
+    }
     size_t getNumChannels() const noexcept { return isPacked() ? packed.getNumChannels() : data.getNumChannels(); }
 };
 
@@ -106,9 +114,21 @@ struct FileData
     {
         ASSERT(readerCount > 0);
         FileSource source;
-        if (status != Status::GarbageCollecting && availableFrames > headFrames() && !streamsWithheld())
-            source.data = AudioSpan<const float>(fileData).first(availableFrames);
-        else if (packedHead.getNumFrames() > 0)
+        const size_t available = availableFrames;
+        // A packed tail follows the head it was started after; a head reloaded longer still
+        // begins with those frames. Reloaded shorter or as floats (the preload probe), the
+        // tail has a gap before it, and the head is read alone.
+        // (The buffers are only looked at once available says the stream has started.)
+        const auto tailFollows = [this] { return packedTail.getNumFrames() == 0 || packedHead.getNumFrames() >= tailStart; };
+        if (status != Status::GarbageCollecting && available > headFrames() && tailFollows() && !streamsWithheld()) {
+            if (packedTail.getNumFrames() == 0)
+                source.data = AudioSpan<const float>(fileData).first(available);
+            else {
+                source.packed = AudioSpan<const int16_t>(packedHead);
+                source.tail = AudioSpan<const int16_t>(packedTail).first(available - tailStart);
+                source.tailStart = tailStart;
+            }
+        } else if (packedHead.getNumFrames() > 0)
             source.packed = AudioSpan<const int16_t>(packedHead);
         else
             source.data = AudioSpan<const float>(preloadedData);
@@ -133,6 +153,8 @@ struct FileData
         preloadedData = std::move(other.preloadedData);
         packedHead = std::move(other.packedHead);
         fileData = std::move(other.fileData);
+        packedTail = std::move(other.packedTail);
+        tailStart = other.tailStart;
         preloadCallCount = other.preloadCallCount;
         availableFrames = other.availableFrames.load();
         lastViewerLeftAt = other.lastViewerLeftAt;
@@ -145,6 +167,8 @@ struct FileData
         preloadedData = std::move(other.preloadedData);
         packedHead = std::move(other.packedHead);
         fileData = std::move(other.fileData);
+        packedTail = std::move(other.packedTail);
+        tailStart = other.tailStart;
         preloadCallCount = other.preloadCallCount;
         availableFrames = other.availableFrames.load();
         lastViewerLeftAt = other.lastViewerLeftAt;
@@ -155,7 +179,9 @@ struct FileData
     FileAudioBuffer preloadedData;      // float head; empty when the head is packed
     PackedHeadBuffer packedHead;        // 16-bit head (setHead)
     FileInformation information;
-    FileAudioBuffer fileData {};
+    FileAudioBuffer fileData {};         // a stream as floats: the whole file, the head copied in
+    PackedHeadBuffer packedTail {};      // a stream of a 16-bit file: the frames past the head
+    size_t tailStart { 0 };              // the head's length when packedTail was started
     int preloadCallCount { 0 };
     std::atomic<Status> status { Status::Invalid };
     bool fullyLoaded { false };
@@ -462,6 +488,8 @@ private:
         size_t position { 0 };        // next frame to decode
         size_t numFrames { 0 };
         size_t decodedFrames { 0 };   // decoded here (the copied head not counted)
+        size_t tailStart { 0 };       // a packed tail: the file's frame its frame 0 is
+        bool packed { false };        // decoded into the packed tail, not the float file
         uint64_t workMicros { 0 };    // time spent on it by the tasks, opening included
         uint64_t firstMicros { 0 };   // the task that opened it and decoded its first chunk
         uint64_t waitMicros { 0 };    // from the request to the start of that task
@@ -492,6 +520,7 @@ private:
     std::vector<FileData*> gcCandidates;   // collectOverBudget's, reserved
     void collectOverBudget(int64_t budget, int& keptReading, int& keptRecent, int& freed) noexcept;
     std::vector<FileAudioBuffer> garbageToCollect;
+    std::vector<PackedHeadBuffer> packedGarbage;   // the packed tails, freed with garbageToCollect
 
     std::shared_ptr<ThreadPool> threadPool;
 
