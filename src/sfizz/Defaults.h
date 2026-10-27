@@ -181,6 +181,7 @@ namespace Default
     extern const OpcodeSpec<int64_t> offset;
     extern const OpcodeSpec<int64_t> offsetMod;
     extern const OpcodeSpec<int64_t> offsetRandom;
+    extern const OpcodeSpec<int64_t> headFrames;
     extern const OpcodeSpec<int64_t> sampleEnd;
     extern const OpcodeSpec<int64_t> sampleEndMod;
     extern const OpcodeSpec<uint32_t> sampleCount;

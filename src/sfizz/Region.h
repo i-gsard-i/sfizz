@@ -240,6 +240,7 @@ struct Region {
     CCMap<float> delayCC { Default::delayMod };
     int64_t offset { Default::offset }; // offset
     int64_t offsetRandom { Default::offsetRandom }; // offset_random
+    int64_t headFrames { Default::headFrames }; // organdroid_head: preload frames, 0 = the pool's
     CCMap<int64_t> offsetCC { Default::offsetMod };
     int64_t sampleEnd { Default::sampleEnd }; // end
     CCMap<int64_t> endCC { Default::sampleEndMod };

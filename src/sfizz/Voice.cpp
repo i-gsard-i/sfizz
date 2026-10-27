@@ -65,6 +65,26 @@ extern "C" void sfizz_dropped_pipes_reset() {
     sDroppedPipes.store(0, std::memory_order_relaxed);
 }
 
+// Never silent (STREAMING_SAFETY_DESIGN.md 4d): the crossfade into and out of the loop a
+// late stream's voice holds, one period of the pipe within these bounds, in frames (shorter
+// than a period, a seam cuts a low pipe's wave mid-way); the loop's length, at most; the
+// frames kept clear of the head's end for the interpolators.
+namespace {
+constexpr int kStarveXfade { 128 };
+constexpr int kStarveXfadeMax { 2048 };
+constexpr double kStarveLoopSeconds { 0.15 };
+constexpr int kStarveMargin { 8 };
+// Late requests (4e): a released voice's reach, for pitch modulation (25 %) and the
+// lookahead at which 4d would start its loop (two blocks of 1024, two crossfades).
+constexpr float kReachSlack { 1.25f };
+constexpr int kReachLook { 2 * 1024 + 2 * kStarveXfadeMax + kStarveMargin };
+std::atomic<bool> sNeverSilent { true };
+}
+// The A/B: off, a late stream's voice ends at its head as before (still counted).
+extern "C" void sfizz_set_never_silent(int on) {
+    sNeverSilent.store(on != 0, std::memory_order_relaxed);
+}
+
 namespace sfz {
 
 struct Voice::Impl
@@ -122,6 +142,12 @@ struct Voice::Impl
      *        needs, converted, then interpolated as before. The conversion is exact, so
      *        the output is the float head's bit for bit.
      */
+    // 4d: how far back to read so that a block from first to last lies below limit, at the
+    // pipe's phase; 0 when it cannot (no period known, a head too short).
+    int starveShiftFor(int first, int last, int limit) noexcept;
+    // 4d: the pipe's period and the crossfade's length, once per voice.
+    void starveLookup() noexcept;
+
     template <bool Adding>
     void fillFromSource(
         const FileSource& source, const AudioSpan<float>& dest,
@@ -288,13 +314,27 @@ struct Voice::Impl
     int gateCc_ { -1 };                 // starting region's stop gate CC (live registration)
     const Layer* compositeLayer_ { nullptr };   // composite attack this voice plays (Composite.h)
     std::array<FileDataHolder, kMaxCompositeMembers> compositeStreams_;
+    std::array<std::shared_ptr<FileId>, kMaxCompositeMembers> compositeStreamIds_;   // 4e: for the late request
     size_t numCompositeStreams_ { 0 };
+    // Late requests (STREAMING_SAFETY_DESIGN.md 4e): the voice asks for its stream, and a
+    // composite for its members', once it has sounded streamRequestAt_ frames.
+    bool streamRequested_ { true };
+    int streamRequestAt_ { 0 };
     int initialDelay_ { 0 };
     int age_ { 0 };
     uint32_t count_ { 1 };
     int sampleEnd_ { 0 };
     int sampleSize_ { 0 };
     bool dropped_ { false };            // counted in sDroppedPipes already (fillWithData)
+    // Never silent (STREAMING_SAFETY_DESIGN.md 4d): while the stream is late, the voice reads
+    // starveShift_ frames behind its true position, a whole number of the pipe's periods.
+    int starveShift_ { 0 };
+    int starveXfOld_ { 0 };             // the shift being crossfaded from
+    int starveXfLeft_ { 0 };            // output frames of that crossfade still to go
+    int starveXfLen_ { kStarveXfade };  // its length: a period of the pipe, bounded
+    float starvePeriod_ { -1.0f };      // source frames; -1 = not looked up, 0 = none known
+    const uint8_t* starveTrack_ { nullptr };
+    size_t starveTrackSize_ { 0 };
 
     struct {
         int start { 0 };
@@ -526,7 +566,10 @@ bool Voice::startVoice(Layer* layer, int delay, const TriggerEvent& event) noexc
         impl.setupOscillatorUnison();
     } else {
         FilePool& filePool = resources.getFilePool();
-        impl.currentPromise_ = filePool.getFilePromise(region.sampleId);
+        const float requestDelay = streamRequestDelay();
+        impl.streamRequested_ = requestDelay <= 0.0f;
+        impl.streamRequestAt_ = static_cast<int>(requestDelay * impl.sampleRate_);
+        impl.currentPromise_ = filePool.getFilePromise(region.sampleId, impl.streamRequested_);
         if (!impl.currentPromise_) {
             impl.switchState(State::cleanMeUp);
             return false;
@@ -580,6 +623,13 @@ bool Voice::startVoice(Layer* layer, int delay, const TriggerEvent& event) noexc
     impl.sampleEnd_ = int(sampleEnd(region, midiState));
     impl.sampleSize_ = impl.sampleEnd_- impl.sourcePosition_ - 1;
     impl.dropped_ = false;
+    impl.starveShift_ = 0;
+    impl.starveXfOld_ = 0;
+    impl.starveXfLeft_ = 0;
+    impl.starveXfLen_ = kStarveXfade;
+    impl.starvePeriod_ = -1.0f;
+    impl.starveTrack_ = nullptr;
+    impl.starveTrackSize_ = 0;
     impl.bendSmoother_.setSmoothing(region.bendSmooth, impl.sampleRate_);
     impl.bendSmoother_.reset(region.getBendInCents(midiState.getPitchBend()));
 
@@ -886,6 +936,30 @@ void Voice::renderBlock(AudioSpan<float, 2> buffer) noexcept
                 impl.release(0);
             }
         }
+    }
+
+    // Late requests (design 4e): a voice still sounding after the delay asks for its
+    // stream (and a composite for its members'); a note gone sooner never streams. Its
+    // deadline counts from its start, so a late request is served before an early one
+    // whose voice started after it. A released voice (a short note still fading at the
+    // delay) asks only if its fade would read past its head: its reach is where the fade
+    // ends, with room for pitch modulation and the never-silent lookahead (4d).
+    if (!impl.streamRequested_ && impl.age_ >= impl.streamRequestAt_) {
+        impl.streamRequested_ = true;
+        FilePool& filePool = impl.resources_.getFilePool();
+        const double sounded = impl.age_ / impl.sampleRate_;
+        const int left = region->flexAmpEG ? -1 : impl.egAmplitude_.releaseFramesLeft();
+        const auto reach = [&](int64_t position, float ratio) -> int64_t {
+            if (left < 0)
+                return -1;
+            return position + static_cast<int64_t>(std::ceil(kReachSlack * ratio * left)) + kReachLook;
+        };
+        if (!region->isOscillator())
+            filePool.requestStream(region->sampleId, sounded,
+                                   reach(impl.sourcePosition_, impl.pitchRatio_ * impl.speedRatio_));
+        for (size_t i = 0; i < impl.numCompositeStreams_; ++i)
+            if (impl.compositeStreamIds_[i])
+                filePool.requestStream(impl.compositeStreamIds_[i], sounded, reach(impl.age_, 1.0f));
     }
 
     const auto delay = min(static_cast<size_t>(impl.initialDelay_), buffer.getNumFrames());
@@ -1218,6 +1292,49 @@ void Voice::Impl::filterStageStereo(AudioSpan<float> buffer) noexcept
     }
 }
 
+void Voice::Impl::starveLookup() noexcept
+{
+    // The phase-track table's period, or, for a pipe without one (the lowest C of a rank, a
+    // piano), the key's, untracked.
+    float period = 0.0f, loopRms = 0.0f;
+    int anchor = 0;
+    if (!releaseAlignLookup(region_->sampleId->filename(), period, anchor, loopRms, starveTrack_, starveTrackSize_)) {
+        starveTrack_ = nullptr;
+        starveTrackSize_ = 0;
+        period = float(currentPromise_->information.sampleRate / midiNoteFrequency(pitchKeycenter_));
+    }
+    starvePeriod_ = period > 1.0f ? period : 0.0f;
+    starveXfLen_ = clamp(int(std::lround(starvePeriod_)), kStarveXfade, kStarveXfadeMax);
+}
+
+int Voice::Impl::starveShiftFor(int first, int last, int limit) noexcept
+{
+    if (starvePeriod_ < 0.0f)
+        starveLookup();
+    const float p = starvePeriod_;
+    if (p <= 0.0f || last < limit)
+        return 0;
+    // The loop: the whole periods in the last ~150 ms below the limit, one at least, and
+    // never more than half of what the head offers.
+    const int n = min(max(1, int(kStarveLoopSeconds * currentPromise_->information.sampleRate / p)),
+                      int(limit / (2.0f * p)));
+    if (n < 1)
+        return 0;
+    const double loopFrames = double(n) * p;
+    // Back by whole loops until the block lies below the limit, a period to spare for the
+    // drift correction.
+    const double back = (std::floor((last - limit + p) / loopFrames) + 1.0) * loopFrames;
+    // The recording drifts (RELEASE_PHASE_TRACK_DESIGN.md): match the phase at the
+    // block's first frame, where the crossfade starts. Equal phase: x + c(x) = y + c(y).
+    float delta = releaseAlignTrackCorrection(starveTrack_, starveTrackSize_, p, first)
+                - releaseAlignTrackCorrection(starveTrack_, starveTrackSize_, p, first - int64_t(back));
+    delta -= p * std::round(delta / p);
+    const int shift = int(std::lround(back - delta));
+    if (first - shift < 0 || last - shift >= limit)
+        return 0;
+    return shift;
+}
+
 void Voice::Impl::fillWithData(AudioSpan<float> buffer) noexcept
 {
     const size_t numSamples = buffer.getNumFrames();
@@ -1288,6 +1405,50 @@ void Voice::Impl::fillWithData(AudioSpan<float> buffer) noexcept
     const bool loopContinuous = (region_->loopMode == LoopMode::loop_continuous);
     const bool loopSustain = (region_->loopMode == LoopMode::loop_sustain) && !released();
     const bool shouldLoop = hasLoopSamples && (loopSustain || loopContinuous) && !loopCountReached;
+
+    // Never silent (STREAMING_SAFETY_DESIGN.md 4d). A voice about to outrun its head while
+    // the stream is late steps back a whole number of the pipe's periods (a loop over the
+    // last ~150 ms of the head) instead of ending; once the stream has caught up it rejoins
+    // its true position. Both steps are crossfaded; indices stay true positions until here.
+    // Counted as a dropped pipe (§6): it hides nothing. A voice looping inside what it has
+    // (shouldLoop: the loop lies in the head) never starves and is left alone: shifted, its
+    // wrapped position would grow by the shift every block.
+    SpanHolder<absl::Span<int>> starveOld;
+    int starveXfFrames = 0;
+    {
+        const int avail = int(source.getNumFrames());
+        const int fileEnd = min(int(sampleEnd_), int(currentPromise_->information.end));
+        const int first = (*indices)[0];
+        const int last = indices->back();
+        const int span = last - first + 1;
+        if (starvePeriod_ < 0.0f && avail < fileEnd
+            && last - starveShift_ + 2 * span + 2 * kStarveXfadeMax + kStarveMargin >= avail)
+            starveLookup();
+        const int look = 2 * span + 2 * starveXfLen_ + kStarveMargin;
+        if (starveShift_ > 0 && (shouldLoop || avail >= fileEnd || last + look < avail)) {
+            starveXfOld_ = starveShift_;
+            starveShift_ = 0;
+            starveXfLeft_ = starveXfLen_;
+        } else if (sNeverSilent.load(std::memory_order_relaxed) && !shouldLoop && avail < fileEnd && last - starveShift_ + look >= avail && !region_->sampleCount) {
+            const int shift = starveShiftFor(first, last, avail - look);
+            if (shift > starveShift_) {
+                starveXfOld_ = starveShift_;
+                starveShift_ = shift;
+                starveXfLeft_ = starveXfLen_;
+                if (!dropped_) {
+                    dropped_ = true;
+                    sDroppedPipes.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        if (starveXfLeft_ > 0 && (starveOld = bufferPool.getIndexBuffer(numSamples))) {
+            starveXfFrames = min(int(numSamples), starveXfLeft_);
+            for (int i = 0; i < starveXfFrames; ++i)
+                (*starveOld)[i] = clamp((*indices)[i] - starveXfOld_, 0, avail - 2);
+        }
+        if (starveShift_ > 0)
+            subtract1(starveShift_, *indices);
+    }
 
     /*
                loop start             loop end
@@ -1542,7 +1703,25 @@ void Voice::Impl::fillWithData(AudioSpan<float> buffer) noexcept
         }
     }
 
-    sourcePosition_ = indices->back();
+    // 4d: the crossfade from the reads at the old shift (linear: the two are in phase).
+    if (starveXfFrames > 0) {
+        auto gains = bufferPool.getBuffer(numSamples);
+        if (gains) {
+            const int done = starveXfLen_ - starveXfLeft_;
+            for (int i = 0; i < starveXfFrames; ++i) {
+                const float a = float(done + i + 1) / float(starveXfLen_);
+                for (size_t c = 0; c < buffer.getNumChannels(); ++c)
+                    buffer.getSpan(c)[i] *= a;
+                (*gains)[i] = 1.0f - a;
+            }
+            fillFromSource<true>(source, buffer.subspan(0, starveXfFrames),
+                starveOld->first(starveXfFrames), coeffs->first(starveXfFrames),
+                gains->first(starveXfFrames), quality);
+        }
+        starveXfLeft_ -= starveXfFrames;
+    }
+
+    sourcePosition_ = indices->back() + starveShift_;
     floatPositionOffset_ = coeffs->back();
 
 #if 1
@@ -1976,8 +2155,10 @@ void Voice::reset() noexcept
     impl.divMask_ = 0xFFFFFFFFu;
     impl.gateCc_ = -1;
     impl.compositeLayer_ = nullptr;
-    for (size_t i = 0; i < impl.numCompositeStreams_; ++i)
+    for (size_t i = 0; i < impl.numCompositeStreams_; ++i) {
         impl.compositeStreams_[i].reset();
+        impl.compositeStreamIds_[i].reset();
+    }
     impl.numCompositeStreams_ = 0;
     impl.age_ = 0;
     impl.count_ = 1;
@@ -2426,9 +2607,12 @@ void Voice::holdCompositeStream(const std::shared_ptr<FileId>& fileId) noexcept
     Impl& impl = *impl_;
     if (impl.numCompositeStreams_ >= impl.compositeStreams_.size())
         return;
-    FileDataHolder holder = impl.resources_.getFilePool().getFilePromise(fileId);
-    if (holder)
+    // 4e: held now, streamed once the composite has sounded the delay (renderBlock)
+    FileDataHolder holder = impl.resources_.getFilePool().getFilePromise(fileId, impl.streamRequested_);
+    if (holder) {
+        impl.compositeStreamIds_[impl.numCompositeStreams_] = fileId;
         impl.compositeStreams_[impl.numCompositeStreams_++] = std::move(holder);
+    }
 }
 
 void Voice::prepareCompositeRelease(float seconds) noexcept

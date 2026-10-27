@@ -60,12 +60,14 @@ static unsigned decodeThreadCount()
 // ---- Decode speed (organdroid patch, STREAMING_SAFETY_DESIGN.md §5) ----
 // The app learns how fast this device decodes a pipe from what it already does: the
 // parallel preload (head frames, the time each worker spent, the wall time) and every
-// stream (frames decoded, the time its chunks took, opening included). Worker
+// stream (frames decoded, the time its chunks took, opening included; and what sets how
+// short a head can be: the first chunk's time, opening included, the wait from the voice's
+// request to it, and how many streams were unfinished then). Worker
 // threads write, the app reads; nothing here runs on the audio thread. Stream timings are
 // kept in a small buffer the app drains; when it is full the oldest go.
 
 namespace {
-struct DecodeTiming { uint32_t frames; uint32_t micros; };
+struct DecodeTiming { uint32_t frames, micros, firstMicros, waitMicros, ahead; };
 constexpr size_t kMaxStreamTimings = 256;
 std::mutex streamTimingsMutex;
 std::vector<DecodeTiming> streamTimings;
@@ -81,12 +83,15 @@ uint64_t microsSince(std::chrono::steady_clock::time_point start)
         std::chrono::steady_clock::now() - start).count());
 }
 
-void recordStreamTiming(uint64_t frames, uint64_t micros)
+uint32_t clamp32(uint64_t v) { return static_cast<uint32_t>(std::min<uint64_t>(v, UINT32_MAX)); }
+
+void recordStreamTiming(uint64_t frames, uint64_t micros, uint64_t firstMicros, uint64_t waitMicros, int ahead)
 {
     std::lock_guard<std::mutex> lock { streamTimingsMutex };
     if (streamTimings.size() >= kMaxStreamTimings)
         streamTimings.erase(streamTimings.begin());
-    streamTimings.push_back({ static_cast<uint32_t>(frames), static_cast<uint32_t>(std::min<uint64_t>(micros, UINT32_MAX)) });
+    streamTimings.push_back({ clamp32(frames), clamp32(micros), clamp32(firstMicros), clamp32(waitMicros),
+                              static_cast<uint32_t>(std::max(ahead, 0)) });
 }
 } // namespace
 
@@ -101,13 +106,17 @@ extern "C" void sfizz_preload_timing(uint64_t* frames, uint64_t* threadMicros, u
 }
 
 // Moves up to max stream timings (oldest first) into the arrays; returns how many.
-extern "C" int sfizz_stream_timings(uint32_t* frames, uint32_t* micros, int max)
+extern "C" int sfizz_stream_timings(uint32_t* frames, uint32_t* micros, uint32_t* firstMicros,
+                                    uint32_t* waitMicros, uint32_t* ahead, int max)
 {
     std::lock_guard<std::mutex> lock { streamTimingsMutex };
     const int n = std::min<int>(max, static_cast<int>(streamTimings.size()));
     for (int i = 0; i < n; ++i) {
         frames[i] = streamTimings[i].frames;
         micros[i] = streamTimings[i].micros;
+        firstMicros[i] = streamTimings[i].firstMicros;
+        waitMicros[i] = streamTimings[i].waitMicros;
+        ahead[i] = streamTimings[i].ahead;
     }
     streamTimings.erase(streamTimings.begin(), streamTimings.begin() + n);
     return n;
@@ -127,6 +136,8 @@ std::atomic<int> gcKeptReading { 0 };
 std::atomic<int> gcKeptRecent { 0 };
 std::atomic<int> gcFreed { 0 };
 std::atomic<int> gcPending { 0 };
+std::atomic<int> gcDue { 0 };          // passes the Synth asked for
+std::atomic<int> gcLockMissed { 0 };   // of those, skipped: the collector's lock was held
 
 int64_t streamedBytes(const sfz::FileAudioBuffer& b)
 {
@@ -134,7 +145,7 @@ int64_t streamedBytes(const sfz::FileAudioBuffer& b)
 }
 } // namespace
 
-// out: {bytes, files, passes, kept reading, kept recent, freed, pending}
+// out: {bytes, files, passes, kept reading, kept recent, freed, pending, due, lock missed}
 extern "C" void sfizz_stream_cache(int64_t* out)
 {
     out[0] = streamBytes.load(std::memory_order_relaxed);
@@ -144,6 +155,61 @@ extern "C" void sfizz_stream_cache(int64_t* out)
     out[4] = gcKeptRecent.load(std::memory_order_relaxed);
     out[5] = gcFreed.load(std::memory_order_relaxed);
     out[6] = gcPending.load(std::memory_order_relaxed);
+    out[7] = gcDue.load(std::memory_order_relaxed);
+    out[8] = gcLockMissed.load(std::memory_order_relaxed);
+}
+
+// The cache budget (design 4f): released streamed files are kept while their bytes fit in
+// it, and over it the ones idle longest are freed first. -1 = sfizz's rule (free what has
+// been idle fileClearingPeriod). Set by the app from what the heads leave spare; lowered on
+// onTrimMemory, which also asks for a pass at once.
+namespace {
+std::atomic<int64_t> cacheBudgetBytes { -1 };
+std::atomic<bool> collectRequested { false };
+} // namespace
+
+extern "C" void sfizz_set_stream_cache_budget(int64_t bytes)
+{
+    cacheBudgetBytes.store(bytes < 0 ? -1 : bytes, std::memory_order_relaxed);
+}
+
+extern "C" void sfizz_collect_streams_now()
+{
+    collectRequested.store(true, std::memory_order_relaxed);
+}
+
+// Late requests (design 4e): decided 2026-10-26 at 0.4 s. The app may set another (the A/B).
+namespace { std::atomic<float> streamRequestDelaySeconds { 0.4f }; }
+extern "C" void sfizz_set_stream_request_delay(float seconds)
+{
+    streamRequestDelaySeconds.store(seconds > 0.0f ? seconds : 0.0f, std::memory_order_relaxed);
+}
+float sfz::streamRequestDelay() noexcept
+{
+    return streamRequestDelaySeconds.load(std::memory_order_relaxed);
+}
+
+// Test only (tools/composite_bench/srender late:): while on, every voice reads its head as
+// if no stream had arrived, so the never-silent fallback (design 4d) can be rendered.
+namespace { std::atomic<bool> streamsWithheldFlag { false }; }
+extern "C" void sfizz_set_streams_withheld(int on)
+{
+    streamsWithheldFlag.store(on != 0, std::memory_order_relaxed);
+}
+bool sfz::streamsWithheld() noexcept
+{
+    return streamsWithheldFlag.load(std::memory_order_relaxed);
+}
+
+bool sfz::FilePool::garbageCollectionDue(size_t framesSince, double sampleRate) noexcept
+{
+    if (collectRequested.exchange(false, std::memory_order_relaxed))
+        return true;
+    // With a budget the time no longer decides what is freed, so pass every second: a
+    // file over the budget waits at most that.
+    const double period = cacheBudgetBytes.load(std::memory_order_relaxed) < 0
+        ? double(config::fileClearingPeriod) : 1.0;
+    return double(framesSince) > period * sampleRate;
 }
 
 extern "C" void sfizz_stream_cache_reset()
@@ -151,6 +217,8 @@ extern "C" void sfizz_stream_cache_reset()
     streamBytes.store(0, std::memory_order_relaxed);
     streamFiles.store(0, std::memory_order_relaxed);
     gcPasses.store(0, std::memory_order_relaxed);
+    gcDue.store(0, std::memory_order_relaxed);
+    gcLockMissed.store(0, std::memory_order_relaxed);
 }
 
 // Threads that serve streams (and decode the preload): the same count for both.
@@ -278,6 +346,7 @@ sfz::FilePool::FilePool()
 {
     activeStreams.reserve(config::maxVoices);
     lastUsedFiles.reserve(config::maxVoices);
+    gcCandidates.reserve(config::maxVoices);
     garbageToCollect.reserve(config::maxVoices);
 }
 
@@ -440,7 +509,7 @@ absl::optional<sfz::FileInformation> sfz::FilePool::getFileInformation(const Fil
     return getReaderInformation(reader.get());
 }
 
-bool sfz::FilePool::preloadFile(const FileId& fileId, uint32_t maxOffset) noexcept
+bool sfz::FilePool::preloadFile(const FileId& fileId, uint32_t maxOffset, uint32_t headFrames) noexcept
 {
     const auto loadedFile = loadedFiles.find(fileId);
     if (loadedFile != loadedFiles.end()) {
@@ -453,6 +522,7 @@ bool sfz::FilePool::preloadFile(const FileId& fileId, uint32_t maxOffset) noexce
         return false;
 
     fileInformation->maxOffset = maxOffset;
+    fileInformation->headFrames = headFrames;
     const fs::path file { rootDirectory / fileId.filename() };
     AudioReaderPtr reader = createAudioReader(file, fileId.isReverse());
 
@@ -461,7 +531,7 @@ bool sfz::FilePool::preloadFile(const FileId& fileId, uint32_t maxOffset) noexce
         if (loadInRam)
             return frames;
         else
-            return min(frames, maxOffset + preloadSize);
+            return min(frames, maxOffset + (headFrames > 0 ? headFrames : preloadSize));
     }();
 
     const auto existingFile = preloadedFiles.find(fileId);
@@ -469,6 +539,7 @@ bool sfz::FilePool::preloadFile(const FileId& fileId, uint32_t maxOffset) noexce
         auto& fileData = existingFile->second;
         if (framesToLoad > fileData.headFrames()) {
             fileData.information.maxOffset = maxOffset;
+            fileData.information.headFrames = headFrames;
             fileData.setHead(readFromFile(*reader, framesToLoad));
             fileData.fullyLoaded = frames == framesToLoad;
         }
@@ -512,7 +583,7 @@ extern "C" void sfizz_preload_progress_reset()
     preloadProgressTotal.store(0, std::memory_order_relaxed);
 }
 
-void sfz::FilePool::preloadFiles(const std::vector<std::pair<FileId, uint32_t>>& files) noexcept
+void sfz::FilePool::preloadFiles(const std::vector<PreloadRequest>& files) noexcept
 {
     preloadProgressDone.store(0, std::memory_order_relaxed);
     preloadProgressTotal.store(static_cast<int>(files.size()), std::memory_order_relaxed);
@@ -522,6 +593,7 @@ void sfz::FilePool::preloadFiles(const std::vector<std::pair<FileId, uint32_t>>&
     struct PreloadJob {
         const FileId* id;
         uint32_t maxOffset;
+        uint32_t headFrames;
         absl::optional<FileInformation> information;
         FileData data;          // the head set in the worker (setHead packs it there)
         bool fullyLoaded { false };
@@ -530,13 +602,14 @@ void sfz::FilePool::preloadFiles(const std::vector<std::pair<FileId, uint32_t>>&
     std::vector<PreloadJob> jobs;
     jobs.reserve(files.size());
     for (const auto& item : files) {
-        if (loadedFiles.contains(item.first) || preloadedFiles.contains(item.first)) {
-            preloadFile(item.first, item.second);
+        if (loadedFiles.contains(item.id) || preloadedFiles.contains(item.id)) {
+            preloadFile(item.id, item.maxOffset, item.headFrames);
             preloadProgressDone.fetch_add(1, std::memory_order_relaxed);
         } else {
             jobs.emplace_back();
-            jobs.back().id = &item.first;
-            jobs.back().maxOffset = item.second;
+            jobs.back().id = &item.id;
+            jobs.back().maxOffset = item.maxOffset;
+            jobs.back().headFrames = item.headFrames;
         }
     }
 
@@ -561,10 +634,11 @@ void sfz::FilePool::preloadFiles(const std::vector<std::pair<FileId, uint32_t>>&
                     auto information = getReaderInformation(reader.get());
                     if (information) {
                         information->maxOffset = job.maxOffset;
+                        information->headFrames = job.headFrames;
                         information->sampleRate = static_cast<double>(reader->sampleRate());
                         const auto frames = static_cast<uint32_t>(reader->frames());
-                        const auto framesToLoad = loadInRam
-                            ? frames : min(frames, job.maxOffset + preloadSize);
+                        const auto framesToLoad = loadInRam ? frames
+                            : min(frames, job.maxOffset + (job.headFrames > 0 ? job.headFrames : preloadSize));
                         job.data.information = *information;
                         job.data.setHead(readFromFile(*reader, framesToLoad));
                         job.fullyLoaded = framesToLoad == frames;
@@ -673,7 +747,7 @@ sfz::FileDataHolder sfz::FilePool::loadFromRam(const FileId& fileId, const std::
     return { &insertedPair.first->second };
 }
 
-sfz::FileDataHolder sfz::FilePool::getFilePromise(const std::shared_ptr<FileId>& fileId) noexcept
+sfz::FileDataHolder sfz::FilePool::getFilePromise(const std::shared_ptr<FileId>& fileId, bool stream) noexcept
 {
     const auto loaded = loadedFiles.find(*fileId);
     if (loaded != loadedFiles.end())
@@ -685,7 +759,25 @@ sfz::FileDataHolder sfz::FilePool::getFilePromise(const std::shared_ptr<FileId>&
         return {};
     }
 
-    auto& fileData = preloaded->second;
+    if (stream)
+        queueStream(fileId, preloaded->second, streamClock());
+    return { &preloaded->second };
+}
+
+void sfz::FilePool::requestStream(const std::shared_ptr<FileId>& fileId, double sounded, int64_t reach) noexcept
+{
+    if (loadedFiles.find(*fileId) != loadedFiles.end())
+        return;
+    const auto preloaded = preloadedFiles.find(*fileId);
+    if (preloaded == preloadedFiles.end())
+        return;
+    if (reach >= 0 && reach <= static_cast<int64_t>(preloaded->second.headFrames()))
+        return;
+    queueStream(fileId, preloaded->second, streamClock() - sounded);
+}
+
+void sfz::FilePool::queueStream(const std::shared_ptr<FileId>& fileId, FileData& fileData, double startedAt) noexcept
+{
     // organdroid: queue the stream only when nobody has yet. An organ chord strikes the
     // same files over and over (every stop x every key, then their release tails), and a
     // stream for a file already Streaming/Done is dropped at once (startStream), so those pushes
@@ -693,23 +785,21 @@ sfz::FileDataHolder sfz::FilePool::getFilePromise(const std::shared_ptr<FileId>&
     const auto status = fileData.status.load();
     const bool needsStream = status == FileData::Status::Preloaded
                           || status == FileData::Status::GarbageCollecting;
-    if (!fileData.fullyLoaded && needsStream) {
-        QueuedFileData queuedData { fileId, &fileData };
-        if (!filesToLoad->try_push(queuedData)) {
-            // Still full: play from the preloaded head rather than dropping the note. The
-            // voice ends early only if it outruns the head before a later voice queues
-            // the stream.
-            DBG("[sfizz] Could not enqueue the file to load for " << fileId << " (queue capacity " << filesToLoad->capacity() << ")");
-            return { &preloaded->second };
-        }
-
-        pendingStreams.fetch_add(1);
-        std::error_code ec;
-        dispatchBarrier.post(ec);
-        ASSERT(!ec);
+    if (fileData.fullyLoaded || !needsStream)
+        return;
+    QueuedFileData queuedData { fileId, &fileData, streamClock(), startedAt };
+    if (!filesToLoad->try_push(queuedData)) {
+        // Still full: play from the preloaded head rather than dropping the note. The
+        // voice ends early only if it outruns the head before a later voice queues
+        // the stream.
+        DBG("[sfizz] Could not enqueue the file to load for " << fileId << " (queue capacity " << filesToLoad->capacity() << ")");
+        return;
     }
 
-    return { &preloaded->second };
+    pendingStreams.fetch_add(1);
+    std::error_code ec;
+    dispatchBarrier.post(ec);
+    ASSERT(!ec);
 }
 
 void sfz::FilePool::setPreloadSize(uint32_t preloadSize) noexcept
@@ -722,6 +812,9 @@ void sfz::FilePool::setPreloadSize(uint32_t preloadSize) noexcept
     for (auto& preloadedFile : preloadedFiles) {
         auto& fileId = preloadedFile.first;
         auto& fileData = preloadedFile.second;
+        // organdroid: one size for every file, the per-stop heads included (the app's
+        // preload probe; a palette load stamps the heads again).
+        fileData.information.headFrames = 0;
         const auto maxOffset = fileData.information.maxOffset;
         fs::path file { rootDirectory / fileId.filename() };
         AudioReaderPtr reader = createAudioReader(file, fileId.isReverse());
@@ -856,7 +949,7 @@ sfz::FilePool::StartResult sfz::FilePool::startStream(ActiveStream& stream) noex
     stream.numFrames = numFrames;
     stream.position = head;
     stream.sampleRate = stream.reader->sampleRate() > 0 ? stream.reader->sampleRate() : config::defaultSampleRate;
-    stream.deadline = stream.requestedAt + head / stream.sampleRate;
+    stream.deadline = stream.startedAt + head / stream.sampleRate;
     stream.started = true;
     return StartResult::Started;
 }
@@ -880,7 +973,7 @@ bool sfz::FilePool::decodeChunk(ActiveStream& stream) noexcept
     stream.position += got;
     stream.decodedFrames += got;
     data.availableFrames.fetch_add(got);
-    stream.deadline = stream.requestedAt + stream.position / stream.sampleRate;
+    stream.deadline = stream.startedAt + stream.position / stream.sampleRate;
     return got < want || stream.position >= stream.numFrames;
 }
 
@@ -909,7 +1002,7 @@ void sfz::FilePool::finishStream(ActiveStream& stream) noexcept
     // What the decode speed means now: frames decoded here over the time the tasks spent
     // on them, opening included (the head is copied, and waits between chunks are not
     // decoding).
-    recordStreamTiming(stream.decodedFrames, stream.workMicros);
+    recordStreamTiming(stream.decodedFrames, stream.workMicros, stream.firstMicros, stream.waitMicros, stream.ahead);
 
     if (std::shared_ptr<FileId> id = stream.id.lock()) {
         std::lock_guard<SpinMutex> guard { garbageAndLastUsedMutex };
@@ -953,9 +1046,16 @@ void sfz::FilePool::streamChunkTask() noexcept
             break;
         }
     }
+    const bool first = stream->started && stream->decodedFrames == 0;
     if (!drop && stream->started)
         finished = decodeChunk(*stream);
-    stream->workMicros += microsSince(start);
+    const uint64_t work = microsSince(start);
+    stream->workMicros += work;
+    if (first && !drop) {
+        stream->firstMicros = work;
+        const double waited = std::chrono::duration<double>(start - streamEpoch).count() - stream->requestedAt;
+        stream->waitMicros = waited > 0 ? static_cast<uint64_t>(waited * 1e6) : 0;
+    }
 
     if (finished)
         finishStream(*stream);
@@ -1006,12 +1106,14 @@ void sfz::FilePool::dispatchingJob() noexcept
         auto stream = std::unique_ptr<ActiveStream>(new ActiveStream);
         stream->id = queuedData.id;
         stream->data = queuedData.data;
-        stream->requestedAt = streamClock();
-        stream->deadline = stream->requestedAt;
+        stream->requestedAt = queuedData.queuedAt;
+        stream->startedAt = queuedData.startedAt;
+        stream->deadline = stream->startedAt;
         {
             std::lock_guard<std::mutex> lock { streamsMutex };
             for (const auto& p : activeStreams)
                 skip = skip || p->data == queuedData.data;
+            stream->ahead = static_cast<int>(activeStreams.size());
             if (!skip)
                 activeStreams.push_back(std::move(stream));
         }
@@ -1093,15 +1195,78 @@ void sfz::FilePool::setRamLoading(bool loadInRam) noexcept
     }
 }
 
+// The budget's pass (design 4f). Called with garbageAndLastUsedMutex held, on the audio
+// thread: no allocation (gcCandidates is reserved like lastUsedFiles). Files a voice reads
+// are kept whatever the budget (the active streams, a separate term in the app's sum).
+void sfz::FilePool::collectOverBudget(int64_t budget, int& keptReading, int& keptRecent, int& freed) noexcept
+{
+    gcCandidates.clear();
+    for (const FileId& id : lastUsedFiles) {
+        auto it = preloadedFiles.find(id);
+        if (it == preloadedFiles.end())
+            continue;
+        FileData& data = it->second;
+        if (data.readerCount != 0) {
+            ++keptReading;
+            continue;
+        }
+        if (data.status.load() == FileData::Status::Done && gcCandidates.size() < gcCandidates.capacity())
+            gcCandidates.push_back(&data);
+    }
+
+    int64_t over = streamBytes.load(std::memory_order_relaxed) - budget;
+    if (over > 0) {
+        // least recently idle first
+        std::sort(gcCandidates.begin(), gcCandidates.end(), [](const FileData* a, const FileData* b) {
+            return a->lastViewerLeftAt < b->lastViewerLeftAt;
+        });
+        for (FileData* data : gcCandidates) {
+            if (over <= 0 || garbageToCollect.size() == garbageToCollect.capacity())
+                break;
+            auto status = FileData::Status::Done;
+            if (!data->status.compare_exchange_strong(status, FileData::Status::GarbageCollecting))
+                continue;
+            if (data->readerCount.load() != 0) {
+                data->status = FileData::Status::Done;
+                continue;
+            }
+            const int64_t bytes = streamedBytes(data->fileData);
+            data->availableFrames = 0;
+            streamBytes.fetch_sub(bytes, std::memory_order_relaxed);
+            streamFiles.fetch_sub(1, std::memory_order_relaxed);
+            over -= bytes;
+            ++freed;
+            garbageToCollect.push_back(std::move(data->fileData));
+            data->status = FileData::Status::Preloaded;
+        }
+    }
+    keptRecent = static_cast<int>(gcCandidates.size()) - freed;
+
+    // Off the list: what was freed (now or before) and what the pool no longer has.
+    swapAndPopAll(lastUsedFiles, [&](const FileId& id) {
+        auto it = preloadedFiles.find(id);
+        if (it == preloadedFiles.end())
+            return true;
+        const FileData& data = it->second;
+        return data.status.load() == FileData::Status::Preloaded && data.availableFrames == 0;
+    });
+}
+
 void sfz::FilePool::triggerGarbageCollection() noexcept
 {
+    gcDue.fetch_add(1, std::memory_order_relaxed);
     const std::unique_lock<SpinMutex> guard { garbageAndLastUsedMutex, std::try_to_lock };
-    if (!guard.owns_lock())
+    if (!guard.owns_lock()) {
+        gcLockMissed.fetch_add(1, std::memory_order_relaxed);
         return;
+    }
 
     const auto now = std::chrono::high_resolution_clock::now();
     int keptReading = 0, keptRecent = 0, freed = 0;
-    swapAndPopAll(lastUsedFiles, [&](const FileId& id) {
+    const int64_t budget = cacheBudgetBytes.load(std::memory_order_relaxed);
+    if (budget >= 0) {
+        collectOverBudget(budget, keptReading, keptRecent, freed);
+    } else swapAndPopAll(lastUsedFiles, [&](const FileId& id) {
         if (garbageToCollect.size() == garbageToCollect.capacity())
            return false;
 

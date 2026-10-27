@@ -62,6 +62,13 @@ using PackedHeadBuffer = AudioBuffer<int16_t, 2, config::defaultAlignment,
                                      sfz::config::excessFileFrames, sfz::config::excessFileFrames>;
 constexpr float kPackedHeadScale { 1.0f / 32768.0f };
 
+// Test only (sfizz_set_streams_withheld): voices read their heads as if streams were late.
+bool streamsWithheld() noexcept;
+
+// Late requests (STREAMING_SAFETY_DESIGN.md 4e): seconds a voice sounds before it asks for
+// its stream; 0 = at its start, as sfizz did (sfizz_set_stream_request_delay).
+float streamRequestDelay() noexcept;
+
 // What a voice reads: float frames (the streamed file, or a head that could not be
 // packed) or a packed head. Exactly one of the two holds frames.
 struct FileSource {
@@ -75,6 +82,7 @@ struct FileSource {
 struct FileInformation {
     int64_t end { Default::sampleEnd };
     int64_t maxOffset { 0 };
+    int64_t headFrames { 0 };   // organdroid: this file's head past maxOffset, 0 = preloadSize
     int64_t loopStart { Default::loopStart };
     int64_t loopEnd { Default::loopEnd };
     bool hasLoop { false };
@@ -98,7 +106,7 @@ struct FileData
     {
         ASSERT(readerCount > 0);
         FileSource source;
-        if (status != Status::GarbageCollecting && availableFrames > headFrames())
+        if (status != Status::GarbageCollecting && availableFrames > headFrames() && !streamsWithheld())
             source.data = AudioSpan<const float>(fileData).first(availableFrames);
         else if (packedHead.getNumFrames() > 0)
             source.packed = AudioSpan<const int16_t>(packedHead);
@@ -267,7 +275,14 @@ public:
      * @return true if the preloading went fine
      * @return false if something went wrong ()
      */
-    bool preloadFile(const FileId& fileId, uint32_t maxOffset) noexcept;
+    bool preloadFile(const FileId& fileId, uint32_t maxOffset, uint32_t headFrames = 0) noexcept;
+
+    /** A file to preload: its largest offset, and its head past it (0 = preloadSize). */
+    struct PreloadRequest {
+        FileId id;
+        uint32_t maxOffset;
+        uint32_t headFrames;
+    };
 
     /**
      * @brief Preload a batch of files, decoding fresh files in parallel on a
@@ -276,9 +291,9 @@ public:
      * one. Also publishes done/total counters for the host's loading bar
      * (see sfizz_preload_progress()).
      *
-     * @param files (fileId, maxOffset) pairs, unique by fileId
+     * @param files unique by fileId
      */
-    void preloadFiles(const std::vector<std::pair<FileId, uint32_t>>& files) noexcept;
+    void preloadFiles(const std::vector<PreloadRequest>& files) noexcept;
 
     /**
      * @brief Load a file and return its information. The file pool will store this
@@ -339,7 +354,14 @@ public:
      * @param fileId the file to preload
      * @return FileDataHolder a file data handle
      */
-    FileDataHolder getFilePromise(const std::shared_ptr<FileId>& fileId) noexcept;
+    FileDataHolder getFilePromise(const std::shared_ptr<FileId>& fileId, bool stream = true) noexcept;
+    /**
+     * organdroid (design 4e): queue the stream of a file whose promise was taken without
+     * one, for a voice that started [sounded] seconds ago (its deadline counts from there).
+     * Nothing when the file is whole in RAM or already streaming, or when the voice will
+     * read no further than [reach] frames and the head holds them (-1: no bound).
+     */
+    void requestStream(const std::shared_ptr<FileId>& fileId, double sounded, int64_t reach = -1) noexcept;
     /**
      * @brief Change the preloading size. This will trigger a full
      * reload of all samples, so don't call it on the audio thread.
@@ -387,6 +409,11 @@ public:
      * risk building up.
      */
     void triggerGarbageCollection() noexcept;
+
+    /** organdroid: whether the Synth should collect now, [framesSince] frames after the
+     *  last pass (every fileClearingPeriod, or every second with a cache budget, or at once
+     *  when the app asked: sfizz_collect_streams_now). */
+    static bool garbageCollectionDue(size_t framesSince, double sampleRate) noexcept;
 private:
 
     absl::optional<sfz::FileInformation> checkExistingFileInformation(const FileId& fileId) noexcept;
@@ -405,11 +432,14 @@ private:
     struct QueuedFileData
     {
         QueuedFileData() noexcept {}
-        QueuedFileData(std::weak_ptr<FileId> id, FileData* data) noexcept
-        : id(id), data(data) {}
+        QueuedFileData(std::weak_ptr<FileId> id, FileData* data, double queuedAt, double startedAt) noexcept
+        : id(id), data(data), queuedAt(queuedAt), startedAt(startedAt) {}
         std::weak_ptr<FileId> id;
         FileData* data { nullptr };
+        double queuedAt { 0.0 };   // stream clock, s: when the voice asked (audio thread)
+        double startedAt { 0.0 };  // stream clock, s: when that voice started (4e: earlier)
     };
+    void queueStream(const std::shared_ptr<FileId>& fileId, FileData& fileData, double startedAt) noexcept;
 
     using FileQueue = atomic_queue::AtomicQueue2<QueuedFileData, config::maxVoices>;
     aligned_unique_ptr<FileQueue> filesToLoad;
@@ -425,13 +455,17 @@ private:
         std::weak_ptr<FileId> id;
         FileData* data { nullptr };
         AudioReaderPtr reader;
-        double requestedAt { 0.0 };   // stream clock, s: when its first voice started
+        double requestedAt { 0.0 };   // stream clock, s: when its first voice asked for it
+        double startedAt { 0.0 };     // stream clock, s: when that voice started playing
         double deadline { 0.0 };      // stream clock, s: when that voice reaches `position`
         double sampleRate { config::defaultSampleRate };
         size_t position { 0 };        // next frame to decode
         size_t numFrames { 0 };
         size_t decodedFrames { 0 };   // decoded here (the copied head not counted)
         uint64_t workMicros { 0 };    // time spent on it by the tasks, opening included
+        uint64_t firstMicros { 0 };   // the task that opened it and decoded its first chunk
+        uint64_t waitMicros { 0 };    // from the request to the start of that task
+        int ahead { 0 };              // streams unfinished when it was requested
         int attempts { 0 };
         bool started { false };
         bool busy { false };
@@ -455,6 +489,8 @@ private:
 
     SpinMutex garbageAndLastUsedMutex;
     std::vector<FileId> lastUsedFiles;
+    std::vector<FileData*> gcCandidates;   // collectOverBudget's, reserved
+    void collectOverBudget(int64_t budget, int& keptReading, int& keptRecent, int& freed) noexcept;
     std::vector<FileAudioBuffer> garbageToCollect;
 
     std::shared_ptr<ThreadPool> threadPool;

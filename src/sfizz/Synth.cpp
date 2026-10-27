@@ -718,7 +718,8 @@ void Synth::Impl::finalizeSfzLoad()
     size_t currentRegionIndex = 0;
     size_t currentRegionCount = layers_.size();
 
-    absl::flat_hash_map<sfz::FileId, int64_t> filesToLoad;
+    // per file: the largest offset, and the head its regions ask for (0 = the pool's size)
+    absl::flat_hash_map<sfz::FileId, std::pair<int64_t, int64_t>> filesToLoad;
 
     auto removeCurrentRegion = [this, &currentRegionIndex, &currentRegionCount]() {
         const Region& region = layers_[currentRegionIndex]->getRegion();
@@ -814,7 +815,8 @@ void Synth::Impl::finalizeSfzLoad()
             }();
 
             auto& toLoad = filesToLoad[*region.sampleId];
-            toLoad = max(toLoad, maxOffset);
+            toLoad.first = max(toLoad.first, maxOffset);
+            toLoad.second = max(toLoad.second, region.headFrames);
         }
         else if (!region.isGenerator()) {
             if (!wavePool.createFileWave(filePool, std::string(region.sampleId->filename()))) {
@@ -916,10 +918,11 @@ void Synth::Impl::finalizeSfzLoad()
     {
         // Batch + parallel-decode the preloads (organdroid patch): same semantics as
         // per-file preloadFile(), but a cold load uses every core and reports progress.
-        std::vector<std::pair<FileId, uint32_t>> preloadList;
+        std::vector<FilePool::PreloadRequest> preloadList;
         preloadList.reserve(filesToLoad.size());
         for (const auto& toLoad: filesToLoad)
-            preloadList.emplace_back(toLoad.first, static_cast<uint32_t>(toLoad.second));
+            preloadList.push_back({ toLoad.first, static_cast<uint32_t>(toLoad.second.first),
+                                    static_cast<uint32_t>(toLoad.second.second) });
         filePool.preloadFiles(preloadList);
     }
 
@@ -1146,7 +1149,7 @@ void Synth::renderBlock(AudioSpan<float> buffer) noexcept
         filePool.waitForBackgroundLoading();
 
     impl.framesSinceGarbageCollection_ += buffer.getNumFrames();
-    if (impl.framesSinceGarbageCollection_ > config::fileClearingPeriod * impl.sampleRate_) {
+    if (FilePool::garbageCollectionDue(impl.framesSinceGarbageCollection_, impl.sampleRate_)) {
         impl.framesSinceGarbageCollection_ = 0;
         filePool.triggerGarbageCollection();
     }

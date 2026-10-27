@@ -84,6 +84,12 @@ public:
      */
     bool isReleased() const noexcept { return currentState >= State::Release || shouldRelease; }
     /**
+     * @brief Frames until a started release falls below the end threshold (the voice
+     * ends there), or -1 while not released. organdroid: a released voice whose fade ends
+     * inside its head needs no stream (STREAMING_SAFETY_DESIGN.md 4e).
+     */
+    int releaseFramesLeft() const noexcept;
+    /**
      * @brief Get the remaining delay samples
      *
      * @return int

@@ -24,6 +24,7 @@ FloatSpec delayMod { 0.0f, {0.0f, 100.0f}, kPermissiveBounds };
 Int64Spec offset { 0, {0, int32_t_max}, kPermissiveBounds };
 Int64Spec offsetMod { 0, {0, int32_t_max}, kPermissiveBounds };
 Int64Spec offsetRandom { 0, {0, int32_t_max}, kPermissiveBounds };
+Int64Spec headFrames { 0, {0, int32_t_max}, kPermissiveBounds };
 Int64Spec sampleEnd { int32_t_max, {0, int32_t_max}, kEnforceBounds };
 Int64Spec sampleEndMod { 0, {-int32_t_max, int32_t_max}, kPermissiveBounds };
 UInt32Spec sampleCount { 0, {0, uint32_t_max}, kEnforceUpperBound };

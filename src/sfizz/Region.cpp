@@ -100,6 +100,9 @@ bool sfz::Region::parseOpcode(const Opcode& rawOpcode, bool cleanOpcode)
     case hash("offset_random"):
         offsetRandom = opcode.read(Default::offsetRandom);
         break;
+    case hash("organdroid_head"):   // the app's per-stop head (STREAMING_SAFETY_DESIGN.md 4c)
+        headFrames = opcode.read(Default::headFrames);
+        break;
     case hash("offset_oncc&"): // also offset_cc&
         if (opcode.parameters.back() > config::numCCs)
             return false;

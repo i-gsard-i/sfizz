@@ -235,6 +235,20 @@ void ADSREnvelope::cancelRelease(int delay) noexcept
     this->releaseDelay = -1;
 }
 
+int ADSREnvelope::releaseFramesLeft() const noexcept
+{
+    if (!isReleased())
+        return -1;
+    const Float v = std::max(currentValue, config::egReleaseThreshold);
+    Float left = 0;
+    if (linearRelease)
+        left = releaseStep > 0 ? (v - config::egReleaseThreshold) / releaseStep : 0;
+    else if (releaseRate > 0)
+        left = std::log(config::egReleaseThreshold / v) / std::log(releaseRate);
+    const int delayed = shouldRelease && releaseDelay > 0 ? releaseDelay : 0;
+    return delayed + static_cast<int>(std::ceil(left));
+}
+
 void ADSREnvelope::setReleaseTime(Float timeInSeconds) noexcept
 {
     releaseRate = secondsToExpRate(timeInSeconds);
