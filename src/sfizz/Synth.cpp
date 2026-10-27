@@ -1294,7 +1294,7 @@ void Synth::renderBlock(AudioSpan<float> buffer) noexcept
     ASSERT(!hasNanInf(buffer.getConstSpan(1)));
     SFIZZ_CHECK(isReasonableAudio(buffer.getConstSpan(0)));
     SFIZZ_CHECK(isReasonableAudio(buffer.getConstSpan(1)));
-    releasePacingRendered();
+    releasePacingRendered(static_cast<int>(impl.voiceManager_.getNumActiveVoices()));
 }
 
 // Release pacing (ReleasePacing.h). A plain note-off, dispatched now, leaving the stops of
@@ -1367,16 +1367,17 @@ static void runPacedOffs(Synth& synth, Synth::Impl& impl) noexcept
     // brings 1/n of the starts
     const ReleasePacingConfig cfg = releasePacingConfig();
     int n = 1;
+    float starts = 0.0f;
     const int sounding = static_cast<int>(impl.voiceManager_.getNumActiveVoices());
     if (cfg.cap > 1 && sfz::releaseAlignEnabled() && released > 0 && sounding > 0 && tick.frames > 0) {
-        const float starts = released * cfg.startCost * tick.load / sounding;
+        starts = released * cfg.startCost * tick.load / sounding;
         const float room = cfg.target - tick.load;
         n = room > 0.0f ? static_cast<int>(std::ceil(starts / room)) : cfg.cap;
         n = std::max(1, std::min({ n, cfg.cap, numStops }));
         if (impl.numDeferredOffs_ + numPending * static_cast<size_t>(numStops) > impl.deferredOffs_.size())
             n = 1;   // no room to hold them all: as before, at once
     }
-    releasePacingRecord(n);
+    releasePacingRecord(n, tick.load, starts, starts > 0.0f ? tick.frames : 0);
     const uint64_t none[2] { 0, 0 };
     if (n == 1) {
         for (size_t i = 0; i < numPending; ++i)
