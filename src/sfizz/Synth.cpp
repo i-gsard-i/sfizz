@@ -1294,6 +1294,7 @@ void Synth::renderBlock(AudioSpan<float> buffer) noexcept
     ASSERT(!hasNanInf(buffer.getConstSpan(1)));
     SFIZZ_CHECK(isReasonableAudio(buffer.getConstSpan(0)));
     SFIZZ_CHECK(isReasonableAudio(buffer.getConstSpan(1)));
+    releasePacingRendered();
 }
 
 // Release pacing (ReleasePacing.h). A plain note-off, dispatched now, leaving the stops of
@@ -1745,6 +1746,7 @@ Voice* Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& trig
     }
 
     if (selectedVoice->startVoice(layer, delay, triggerEvent)) {
+        releasePacingVoiceStarted(triggerEvent.type == TriggerEventType::NoteOn && !handingOver_);
         // Record the divisions this voice actually SOUNDS for (DivisionGate.h): the note
         // event's mask intersected with the region's own division. A coupled note-on
         // (mask = dest|src) starts each stop's voice with only that stop's division bit,
@@ -1919,7 +1921,9 @@ void Synth::Impl::handOverComposite(Voice& composite) noexcept
         TriggerEvent own = event;
         if (i < link.memberKeys.size())
             own.number = link.memberKeys[i];
+        handingOver_ = true;   // not struck: the start cost is measured from strikes
         started[i] = startVoice(link.members[i], 0, own, ring);
+        handingOver_ = false;
     }
 
     // Starting a voice can steal one when none is free; if that was the composite itself,

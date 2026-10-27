@@ -446,6 +446,7 @@ struct Synth::Impl final: public Parser::Listener {
     size_t numDeferredOffs_ { 0 };
     uint32_t pacingSerial_ { 0 };
     bool pacingDispatch_ { false };   // a paced note-off dispatching: not queued again
+    bool handingOver_ { false };      // a composite's members starting (handOverComposite)
     // Set while a paced note-off dispatches: the stops (one bit per gate CC) it leaves
     // sounding, their voices and tails, for a later per-stop note-off.
     uint64_t dispatchDeferCc_[2] {};
