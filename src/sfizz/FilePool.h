@@ -65,8 +65,8 @@ constexpr float kPackedHeadScale { 1.0f / 32768.0f };
 // Test only (sfizz_set_streams_withheld): voices read their heads as if streams were late.
 bool streamsWithheld() noexcept;
 
-// Late requests (STREAMING_SAFETY_DESIGN.md 4e): seconds a voice sounds before it asks for
-// its stream; 0 = at its start, as sfizz did (sfizz_set_stream_request_delay).
+// Late requests (STREAMING_SAFETY_DESIGN.md 4e, 9b): seconds of its file a voice reads before
+// it asks for its stream; 0 = at its start, as sfizz did (sfizz_set_stream_request_delay).
 float streamRequestDelay() noexcept;
 
 // What a voice reads: float frames (the streamed file, or a head that could not be

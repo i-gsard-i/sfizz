@@ -179,8 +179,9 @@ extern "C" void sfizz_collect_streams_now()
     collectRequested.store(true, std::memory_order_relaxed);
 }
 
-// Late requests (design 4e): decided 2026-10-26 at 0.4 s. The app may set another (the A/B).
-namespace { std::atomic<float> streamRequestDelaySeconds { 0.4f }; }
+// Late requests (design 4e, 9b): the app sets the latest safe moment at every load, its heads
+// less their floor (HeadPlan.kt); 0, at the voice's start as sfizz did, until it does.
+namespace { std::atomic<float> streamRequestDelaySeconds { 0.0f }; }
 extern "C" void sfizz_set_stream_request_delay(float seconds)
 {
     streamRequestDelaySeconds.store(seconds > 0.0f ? seconds : 0.0f, std::memory_order_relaxed);

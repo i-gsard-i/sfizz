@@ -566,9 +566,7 @@ bool Voice::startVoice(Layer* layer, int delay, const TriggerEvent& event) noexc
         impl.setupOscillatorUnison();
     } else {
         FilePool& filePool = resources.getFilePool();
-        const float requestDelay = streamRequestDelay();
-        impl.streamRequested_ = requestDelay <= 0.0f;
-        impl.streamRequestAt_ = static_cast<int>(requestDelay * impl.sampleRate_);
+        impl.streamRequested_ = streamRequestDelay() <= 0.0f;
         impl.currentPromise_ = filePool.getFilePromise(region.sampleId, impl.streamRequested_);
         if (!impl.currentPromise_) {
             impl.switchState(State::cleanMeUp);
@@ -597,6 +595,11 @@ bool Voice::startVoice(Layer* layer, int delay, const TriggerEvent& event) noexc
     // apply stretch tuning if set
     if (absl::optional<StretchTuning>& stretch = resources.getStretch())
         impl.pitchRatio_ *= stretch->getRatioForFractionalKey(numberRetuned);
+
+    // The delay is in the file's time, as the heads are (design 9b): a pipe tuned up reads
+    // its head faster, so it asks sooner.
+    impl.streamRequestAt_ = static_cast<int>(streamRequestDelay() * impl.sampleRate_
+                                             / max(impl.pitchRatio_, 1e-3f));
 
     impl.pitchKeycenter_ = region.pitchKeycenter;
     impl.baseVolumedB_ = baseVolumedB(region, midiState, impl.triggerEvent_.number);
