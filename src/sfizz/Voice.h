@@ -500,6 +500,13 @@ public:
     void holdCompositeStream(const std::shared_ptr<FileId>& fileId) noexcept;
 
     /**
+     * @brief Ask for the stream of this pipe's tail at its note-on, the tail being certain
+     * (STREAMING_SAFETY_DESIGN.md 9c), and hold the file until reset(), so a stream decoded
+     * before the note-off is still there when the tail starts.
+     */
+    void holdTailStream(const std::shared_ptr<FileId>& fileId) noexcept;
+
+    /**
      * @brief Fade this composite voice out over `seconds` as the equal-power half of its
      * crossfade into the summed tail. Call before registerNoteOff().
      */

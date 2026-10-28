@@ -2200,8 +2200,31 @@ void Synth::Impl::noteOnDispatch(int delay, int noteNumber, float velocity) noex
             voice->setCompositeLayer(layer);
             for (const Layer* member : link.members)
                 voice->holdCompositeStream(member->getRegion().sampleId);
+            // Its summed tail always follows (startCompositeTail); the staccato tail only
+            // for a short note, so it is left to its head (design 9c).
+            if (link.tail && sfz::earlyTails() && sfz::releaseAlignEnabled())
+                voice->holdTailStream(link.tail->getRegion().sampleId);
             suppress[0] |= link.memberCcs[0];
             suppress[1] |= link.memberCcs[1];
+        }
+    }
+
+    // Tails asked when certain (design 9c): a stop with one tail region on this key will
+    // sound it at the note-off, so its pipe asks for it now. Two or more (a staccato tail
+    // beside the long one, round robins) are left to the note-off. By stop gate CC.
+    std::array<const Region*, 128> tailOf;
+    std::array<uint8_t, 128> tailCount;
+    const bool early = sfz::earlyTails();
+    if (early) {
+        tailCount.fill(0);
+        for (const Layer* layer : noteActivationLists_[noteNumber]) {
+            const Region& region = layer->getRegion();
+            if (region.trigger != Trigger::release || region.isOscillator() || region.gateCc < 0
+                || region.gateCc >= 128 || (region.divMask & dispatchDivMask_) == 0
+                || !layer->isSwitchedOn())   // the tails switched off (OrganEngine TAILS_CC)
+                continue;
+            tailOf[region.gateCc] = &region;
+            tailCount[region.gateCc] = static_cast<uint8_t>(min(tailCount[region.gateCc] + 1, 2));
         }
     }
 
@@ -2223,7 +2246,10 @@ void Synth::Impl::noteOnDispatch(int delay, int noteNumber, float velocity) noex
 
             checkOffGroups(&region, delay, noteNumber);
             TriggerEvent triggerEvent { TriggerEventType::NoteOn, noteNumber, velocity };
-            startVoice(layer, delay, triggerEvent, ring);
+            Voice* voice = startVoice(layer, delay, triggerEvent, ring);
+            if (voice && early && region.trigger == Trigger::attack && !region.isOscillator()
+                && gateCc >= 0 && gateCc < 128 && tailCount[gateCc] == 1)
+                voice->holdTailStream(tailOf[gateCc]->sampleId);
         }
     }
 

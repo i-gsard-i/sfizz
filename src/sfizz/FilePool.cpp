@@ -191,6 +191,25 @@ float sfz::streamRequestDelay() noexcept
     return streamRequestDelaySeconds.load(std::memory_order_relaxed);
 }
 
+namespace {
+std::atomic<bool> earlyTailsFlag { true };
+std::atomic<int> tailsAsked { 0 };     // tail streams queued at a note-on
+std::atomic<int> tailsMovedUp { 0 };   // of those, still waiting when their tail started
+} // namespace
+extern "C" void sfizz_set_early_tails(int on)
+{
+    earlyTailsFlag.store(on != 0, std::memory_order_relaxed);
+}
+extern "C" void sfizz_tail_stream_counts(int* asked, int* movedUp)
+{
+    if (asked) *asked = tailsAsked.load();
+    if (movedUp) *movedUp = tailsMovedUp.load();
+}
+bool sfz::earlyTails() noexcept
+{
+    return earlyTailsFlag.load(std::memory_order_relaxed);
+}
+
 // Test only (tools/composite_bench/srender late:): while on, every voice reads its head as
 // if no stream had arrived, so the never-silent fallback (design 4d) can be rendered.
 namespace { std::atomic<bool> streamsWithheldFlag { false }; }
@@ -779,19 +798,46 @@ void sfz::FilePool::requestStream(const std::shared_ptr<FileId>& fileId, double 
     queueStream(fileId, preloaded->second, streamClock() - sounded);
 }
 
-void sfz::FilePool::queueStream(const std::shared_ptr<FileId>& fileId, FileData& fileData, double startedAt) noexcept
+void sfz::FilePool::requestTail(const std::shared_ptr<FileId>& fileId, int64_t reach) noexcept
+{
+    if (loadedFiles.find(*fileId) != loadedFiles.end())
+        return;
+    const auto preloaded = preloadedFiles.find(*fileId);
+    if (preloaded == preloadedFiles.end())
+        return;
+    if (reach >= 0 && reach <= static_cast<int64_t>(preloaded->second.headFrames()))
+        return;
+    queueStream(fileId, preloaded->second, streamClock(), true);
+}
+
+void sfz::FilePool::promoteTail(const std::shared_ptr<FileId>& fileId, double sounded) noexcept
+{
+    const auto preloaded = preloadedFiles.find(*fileId);
+    if (preloaded != preloadedFiles.end() && preloaded->second.tailPending.load())
+        queueStream(fileId, preloaded->second, streamClock() - sounded);
+}
+
+void sfz::FilePool::queueStream(const std::shared_ptr<FileId>& fileId, FileData& fileData, double startedAt, bool tail) noexcept
 {
     // organdroid: queue the stream only when nobody has yet. An organ chord strikes the
     // same files over and over (every stop x every key, then their release tails), and a
     // stream for a file already Streaming/Done is dropped at once (startStream), so those pushes
     // only filled the 256-slot queue; a full queue then refused the voice outright.
+    // One exception (design 9d): a request with a deadline for a file asked as a certain
+    // tail goes through, once, for the dispatcher to move that stream up.
     const auto status = fileData.status.load();
     const bool needsStream = status == FileData::Status::Preloaded
                           || status == FileData::Status::GarbageCollecting;
-    if (fileData.fullyLoaded || !needsStream)
+    const bool promote = !tail && fileData.tailPending.exchange(false)
+                      && status == FileData::Status::Streaming;
+    if (fileData.fullyLoaded || !(needsStream || promote))
         return;
-    QueuedFileData queuedData { fileId, &fileData, streamClock(), startedAt };
+    QueuedFileData queuedData { fileId, &fileData, streamClock(), startedAt, tail };
+    if (tail)
+        fileData.tailPending = true;
     if (!filesToLoad->try_push(queuedData)) {
+        if (tail)
+            fileData.tailPending = false;
         // Still full: play from the preloaded head rather than dropping the note. The
         // voice ends early only if it outruns the head before a later voice queues
         // the stream.
@@ -800,6 +846,8 @@ void sfz::FilePool::queueStream(const std::shared_ptr<FileId>& fileId, FileData&
     }
 
     pendingStreams.fetch_add(1);
+    if (tail)
+        tailsAsked.fetch_add(1, std::memory_order_relaxed);
     std::error_code ec;
     dispatchBarrier.post(ec);
     ASSERT(!ec);
@@ -897,8 +945,25 @@ void sfz::FilePool::enqueueStreamTask() noexcept
     threadPool->enqueue([this]() { streamChunkTask(); });
 }
 
+double sfz::FilePool::rankOf(const ActiveStream& stream) noexcept
+{
+    // Every deadline is on the stream clock, seconds since the pool was made: a certain
+    // tail's rank, past any of them, keeps the tails in the order they were asked.
+    constexpr double kAfterDeadlines { 1e9 };
+    return stream.tail ? kAfterDeadlines + stream.startedAt : stream.deadline;
+}
+
+void sfz::FilePool::promote(ActiveStream& stream, double startedAt) noexcept
+{
+    stream.tail = false;
+    stream.promoteTo = -1.0;
+    stream.startedAt = startedAt;
+    stream.deadline = startedAt + (stream.started ? stream.position / stream.sampleRate : 0.0);
+}
+
 void sfz::FilePool::removeStream(ActiveStream* stream) noexcept
 {
+    stream->data->tailPending = false;
     {
         std::lock_guard<std::mutex> lock { streamsMutex };
         const auto it = std::find_if(activeStreams.begin(), activeStreams.end(),
@@ -1080,7 +1145,7 @@ void sfz::FilePool::streamChunkTask() noexcept
     {
         std::lock_guard<std::mutex> lock { streamsMutex };
         for (const auto& p : activeStreams)
-            if (!p->busy && (!stream || p->deadline < stream->deadline))
+            if (!p->busy && (!stream || rankOf(*p) < rankOf(*stream)))
                 stream = p.get();
         if (stream)
             stream->busy = true;
@@ -1126,6 +1191,8 @@ void sfz::FilePool::streamChunkTask() noexcept
     {
         std::lock_guard<std::mutex> lock { streamsMutex };
         stream->busy = false;
+        if (stream->promoteTo >= 0.0)
+            promote(*stream, stream->promoteTo);
     }
     enqueueStreamTask();
 }
@@ -1167,10 +1234,23 @@ void sfz::FilePool::dispatchingJob() noexcept
         stream->requestedAt = queuedData.queuedAt;
         stream->startedAt = queuedData.startedAt;
         stream->deadline = stream->startedAt;
+        stream->tail = queuedData.tail;
         {
             std::lock_guard<std::mutex> lock { streamsMutex };
-            for (const auto& p : activeStreams)
-                skip = skip || p->data == queuedData.data;
+            for (const auto& p : activeStreams) {
+                if (p->data != queuedData.data)
+                    continue;
+                skip = true;
+                // A tail started (9d): its stream takes the tail's deadline, now or, while a
+                // task decodes it, when that task gives it back.
+                if (p->tail && !queuedData.tail) {
+                    tailsMovedUp.fetch_add(1, std::memory_order_relaxed);
+                    if (p->busy)
+                        p->promoteTo = queuedData.startedAt;
+                    else
+                        promote(*p, queuedData.startedAt);
+                }
+            }
             stream->ahead = static_cast<int>(activeStreams.size());
             if (!skip)
                 activeStreams.push_back(std::move(stream));

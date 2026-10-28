@@ -69,6 +69,10 @@ bool streamsWithheld() noexcept;
 // it asks for its stream; 0 = at its start, as sfizz did (sfizz_set_stream_request_delay).
 float streamRequestDelay() noexcept;
 
+// Tails asked when certain (design 9c): a pipe's tail is asked at its note-on, when it has
+// one tail; on by default (sfizz_set_early_tails, the A/B).
+bool earlyTails() noexcept;
+
 // What a voice reads: float frames (the streamed file, or a head that could not be
 // packed) or a packed head, and after it, when the file is streamed, the packed rest of
 // the file (its frame 0 is the file's frame tailStart). Exactly one of data and packed
@@ -187,6 +191,9 @@ struct FileData
     bool fullyLoaded { false };
     std::atomic<size_t> availableFrames { 0 };
     std::atomic<int> readerCount { 0 };
+    // organdroid (design 9c): its stream was asked as a certain tail, with no deadline yet;
+    // the first request with one moves it up (FilePool::queueStream).
+    std::atomic<bool> tailPending { false };
     std::chrono::time_point<std::chrono::high_resolution_clock> lastViewerLeftAt;
 
     LEAK_DETECTOR(FileData);
@@ -389,6 +396,17 @@ public:
      */
     void requestStream(const std::shared_ptr<FileId>& fileId, double sounded, int64_t reach = -1) noexcept;
     /**
+     * organdroid (design 9c, 9d): queue the stream of a tail that will certainly sound, its
+     * pipe's attack having started: served after every stream with a deadline, by when it
+     * was asked. Nothing when the head holds [reach] frames (-1: no bound).
+     */
+    void requestTail(const std::shared_ptr<FileId>& fileId, int64_t reach = -1) noexcept;
+    /**
+     * organdroid (design 9d): the tail has started, [sounded] seconds of its file ago: a stream
+     * still waiting as a certain tail takes that deadline. Nothing for any other file.
+     */
+    void promoteTail(const std::shared_ptr<FileId>& fileId, double sounded) noexcept;
+    /**
      * @brief Change the preloading size. This will trigger a full
      * reload of all samples, so don't call it on the audio thread.
      *
@@ -458,14 +476,15 @@ private:
     struct QueuedFileData
     {
         QueuedFileData() noexcept {}
-        QueuedFileData(std::weak_ptr<FileId> id, FileData* data, double queuedAt, double startedAt) noexcept
-        : id(id), data(data), queuedAt(queuedAt), startedAt(startedAt) {}
+        QueuedFileData(std::weak_ptr<FileId> id, FileData* data, double queuedAt, double startedAt, bool tail) noexcept
+        : id(id), data(data), queuedAt(queuedAt), startedAt(startedAt), tail(tail) {}
         std::weak_ptr<FileId> id;
         FileData* data { nullptr };
         double queuedAt { 0.0 };   // stream clock, s: when the voice asked (audio thread)
         double startedAt { 0.0 };  // stream clock, s: when that voice started (4e: earlier)
+        bool tail { false };       // a certain tail (9c): no deadline yet
     };
-    void queueStream(const std::shared_ptr<FileId>& fileId, FileData& fileData, double startedAt) noexcept;
+    void queueStream(const std::shared_ptr<FileId>& fileId, FileData& fileData, double startedAt, bool tail = false) noexcept;
 
     using FileQueue = atomic_queue::AtomicQueue2<QueuedFileData, config::maxVoices>;
     aligned_unique_ptr<FileQueue> filesToLoad;
@@ -497,7 +516,14 @@ private:
         int attempts { 0 };
         bool started { false };
         bool busy { false };
+        // A certain tail (9c) ranks after every deadline, by startedAt (its note-on), until
+        // its tail starts: then promoteTo, its start, waits here while a task holds it.
+        bool tail { false };
+        double promoteTo { -1.0 };
     };
+    // Its rank in the queue (9d), under streamsMutex: the deadline, or after them all.
+    static double rankOf(const ActiveStream& stream) noexcept;
+    static void promote(ActiveStream& stream, double startedAt) noexcept;
     enum class StartResult { Started, Retry, Drop };
     void streamChunkTask() noexcept;
     StartResult startStream(ActiveStream& stream) noexcept;

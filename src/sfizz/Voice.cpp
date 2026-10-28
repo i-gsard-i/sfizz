@@ -316,6 +316,7 @@ struct Voice::Impl
     std::array<FileDataHolder, kMaxCompositeMembers> compositeStreams_;
     std::array<std::shared_ptr<FileId>, kMaxCompositeMembers> compositeStreamIds_;   // 4e: for the late request
     size_t numCompositeStreams_ { 0 };
+    FileDataHolder tailStream_;   // this pipe's tail, asked at the note-on (design 9c)
     // Late requests (STREAMING_SAFETY_DESIGN.md 4e): the voice asks for its stream, and a
     // composite for its members', once it has sounded streamRequestAt_ frames.
     bool streamRequested_ { true };
@@ -600,6 +601,12 @@ bool Voice::startVoice(Layer* layer, int delay, const TriggerEvent& event) noexc
     // its head faster, so it asks sooner.
     impl.streamRequestAt_ = static_cast<int>(streamRequestDelay() * impl.sampleRate_
                                              / max(impl.pitchRatio_, 1e-3f));
+
+    // A tail whose stream was asked at its note-on and is not decoded yet: it now has a
+    // deadline, its start (design 9d). It reads from its aligned start, not from frame 0.
+    if (region.isRelease() && !impl.streamRequested_ && !region.isOscillator() && impl.currentPromise_)
+        resources.getFilePool().promoteTail(region.sampleId,
+            impl.sourcePosition_ / max(impl.currentPromise_->information.sampleRate, 1.0));
 
     impl.pitchKeycenter_ = region.pitchKeycenter;
     impl.baseVolumedB_ = baseVolumedB(region, midiState, impl.triggerEvent_.number);
@@ -2179,6 +2186,7 @@ void Voice::reset() noexcept
         impl.compositeStreamIds_[i].reset();
     }
     impl.numCompositeStreams_ = 0;
+    impl.tailStream_.reset();
     impl.age_ = 0;
     impl.count_ = 1;
     impl.floatPositionOffset_ = 0.0f;
@@ -2632,6 +2640,30 @@ void Voice::holdCompositeStream(const std::shared_ptr<FileId>& fileId) noexcept
         impl.compositeStreamIds_[impl.numCompositeStreams_] = fileId;
         impl.compositeStreams_[impl.numCompositeStreams_++] = std::move(holder);
     }
+}
+
+void Voice::holdTailStream(const std::shared_ptr<FileId>& fileId) noexcept
+{
+    Impl& impl = *impl_;
+    FilePool& filePool = impl.resources_.getFilePool();
+    impl.tailStream_ = filePool.getFilePromise(fileId, false);
+    if (!impl.tailStream_)
+        return;
+    // Cut tails (ReleaseAlign.h) read only their first `cut` seconds, from an aligned start
+    // under anchor + 2 periods of this pipe's loop: no stream when the head holds that.
+    int64_t reach = -1;
+    const float cut = sfz::releaseTailCut();
+    if (cut > 0.0f) {
+        float period = 0.0f, loopRms = 0.0f; int anchor = 0;
+        const uint8_t* track = nullptr; size_t trackSize = 0;
+        int64_t lead = 0;
+        if (impl.region_ && sfz::releaseAlignLookup(impl.region_->sampleId->filename(), period, anchor,
+                                                    loopRms, track, trackSize))
+            lead = anchor + static_cast<int64_t>(std::ceil(2.0f * period));
+        reach = lead + static_cast<int64_t>(std::ceil(kReachSlack * cut * impl.sampleRate_
+                                                      * impl.pitchRatio_ * impl.speedRatio_)) + kReachLook;
+    }
+    filePool.requestTail(fileId, reach);
 }
 
 void Voice::prepareCompositeRelease(float seconds) noexcept
