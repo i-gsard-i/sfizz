@@ -278,6 +278,10 @@ struct Region {
     // Owning stop's gate CC (Jukkasjarvi live registration, DivisionGate.h): custom
     // `stop_cc=N` opcode; -1 = untagged. Filtered note events act only on their stop.
     int gateCc { -1 }; // stop_cc
+    // A wet recording (`organdroid_wet`, 1 = absent): its tails carry the room's decay,
+    // which goes on when the pipe is struck again. 0 = dry: a re-strike ends the pipe's
+    // earlier tails (ReleaseAlign.h, sfizz_restrike_ends_tails).
+    bool wet { true }; // organdroid_wet
     // Composite stops (Composite.h; organdroid docs/design/COMPOSITE_STOPS_DESIGN.md).
     // `composite=N` marks a composite region: a pre-summed attack of several stops' pipes
     // (an attack region) or its summed tail (trigger=release). Normal note dispatch skips

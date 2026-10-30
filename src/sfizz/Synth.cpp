@@ -1694,6 +1694,13 @@ Voice* Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& trig
 
     selectedVoice->reset();
 
+    // A re-struck pipe enters its attack at the tail's level (endRestruckTails).
+    const bool restrike = restrikeStart_ >= 0 && !region.isRelease();
+    if (restrike)
+        selectedVoice->setAttackStartOverride(restrikeStart_, restrikePeriod_);
+    restrikeStart_ = -1;
+    float tailFull = 0.0f;
+
     // Phase-aligned release tails (ReleaseAlign.h): when this is a release voice and the
     // master enable is on, start the release sample in phase with the sustain loop it is
     // replacing. `region` here is the RELEASE region; the alignment data is keyed by the
@@ -1740,6 +1747,7 @@ Voice* Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& trig
                     float f = (full > 1e-9f) ? std::sqrt(attack->getCurrentPower()) / full : 1.0f;
                     f = f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
                     selectedVoice->setReleaseGainScale(f);
+                    tailFull = full;
                 }
                 releaseAligned = true;
             }
@@ -1757,10 +1765,12 @@ Voice* Synth::Impl::startVoice(Layer* layer, int delay, const TriggerEvent& trig
         // And its stop's gate CC, so a stop-filtered retro note-off releases only that
         // stop's voices (live registration).
         selectedVoice->setGateCc(region.gateCc);
+        selectedVoice->setTailFullLevel(tailFull);
         // Stretch the aligned release voice's linear fade-in to the crossfade window so it
         // is complementary to the sustain's linear fade-out (ReleaseAlign.h). Done after
         // startVoice (which resets the EG); stopDynamicUpdates() pins it past ampeg_attack.
-        if (releaseAligned) {
+        // A re-struck pipe's attack fades in the same way against its tail's fade-out.
+        if (releaseAligned || restrike) {
             if (ADSREnvelope* eg = selectedVoice->getAmplitudeEG()) {
                 eg->setAttackTime(sfz::releaseAlignCrossfade());
                 eg->stopDynamicUpdates();
@@ -2106,6 +2116,87 @@ void Synth::Impl::startCompositeTailVoice(Voice& composite, Layer* tail, const s
     ring.addVoiceToRing(voice);
 }
 
+void Synth::Impl::endRestruckTails(const Region& attack, int delay, int number) noexcept
+{
+    const auto restruck = [&](Voice& voice) {
+        const Region* tail = voice.getRegion();
+        return tail != nullptr && tail->trigger == Trigger::release && tail->compositeId < 0
+            && tail->gateCc == attack.gateCc && voice.getTriggerEvent().number == number
+            && !voice.offedOrFree() && sfz::restrikeEndsTail(tail->wet);
+    };
+
+    // The pipe sounding its tail is a resonator ringing at the tail's level, and struck again
+    // it speaks as its attack does from where the attack reached that level
+    // (RESTRIKE_HANDOVER_DESIGN.md §2). So the loudest tail, still at its recorded fade, hands
+    // over there, at the frame the tail track gives, over the note-off crossfade.
+    float period = 0.0f, loopRms = 0.0f; int anchor = 0;
+    const uint8_t* track = nullptr; size_t trackSize = 0;
+    const uint8_t* onset = nullptr; size_t onsetSize = 0;
+    const uint8_t* tailTrack = nullptr; size_t tailTrackSize = 0;
+    const bool data = sfz::releaseAlignEnabled() && attack.sampleId && !attack.isOscillator()
+        && sfz::releaseAlignLookup(attack.sampleId->filename(), period, anchor, loopRms, track, trackSize)
+        && sfz::releaseAlignOnset(attack.sampleId->filename(), onset, onsetSize)
+        && sfz::releaseAlignTail(attack.sampleId->filename(), tailTrack, tailTrackSize);
+    Voice* from = nullptr;
+    float loudest = 0.0f;
+    if (data) {
+        voiceManager_.forEachActive([&](Voice& voice) {
+            if (!restruck(voice) || voice.getTailFullLevel() <= 0.0f)
+                return;
+            const ADSREnvelope* eg = voice.getAmplitudeEG();
+            if (eg == nullptr || eg->isReleased())
+                return;   // already fading (cut, retired): it ends on its own
+            const float power = voice.getRecentPower(period / std::max(voice.getSourceRatio(), 1e-3f));
+            if (power > loudest) {
+                loudest = power;
+                from = &voice;
+            }
+        });
+    }
+    if (from != nullptr) {
+        const int64_t loopPeriod = std::lround(period);
+        const int64_t r = from->getSourcePosition() + std::lround(from->getSourceRatio() * static_cast<float>(delay));
+        int64_t g = sfz::restrikeTailEntry(tailTrack, tailTrackSize, period, r);
+        // A tail turned down at its note-off is that much quieter than recorded: the attack
+        // enters earlier, where it is as loud, at the phase its own phase track carries there.
+        // Attack frames x and y are in phase when y - x = c(x) - c(y) mod P, since both are then
+        // in phase with the same tail frame (RELEASE_PHASE_TRACK_DESIGN.md §2).
+        const float scale = from->getTailScale();
+        if (g >= 0 && scale < 1.0f && loopPeriod > 0) {
+            const int64_t k = (g + loopPeriod / 2) / loopPeriod;
+            const float recorded = k < static_cast<int64_t>(onsetSize) ? onset[k] / 255.0f : 1.0f;
+            const int64_t y = sfz::restrikeEntry(onset, onsetSize, period, scale * recorded);
+            if (y < k * loopPeriod) {
+                float shift = std::fmod(static_cast<float>(g - y)
+                    + sfz::releaseAlignTrackCorrection(track, trackSize, period, g)
+                    - sfz::releaseAlignTrackCorrection(track, trackSize, period, y), period);
+                if (shift < 0.0f)
+                    shift += period;
+                if (shift >= 0.5f * period)
+                    shift -= period;
+                g = y + std::lround(shift);
+                if (g < 0)
+                    g += loopPeriod;
+            }
+        }
+        if (g < 0) {
+            from = nullptr;   // past its tail track the tail is too quiet to match: it is cut
+        } else {
+            restrikeStart_ = static_cast<int>(g);
+            restrikePeriod_ = period;
+        }
+    }
+
+    voiceManager_.forEachActive([&](Voice& voice) {
+        if (!restruck(voice))
+            return;
+        if (&voice == from)
+            voice.fadeOut(delay, sfz::releaseAlignCrossfade());
+        else
+            voice.off(delay, true);
+    });
+}
+
 void Synth::Impl::checkOffGroups(const Region* region, int delay, int number, bool chokedByCC)
 {
     voiceManager_.forEachActive([&](Voice& voice) {
@@ -2228,6 +2319,8 @@ void Synth::Impl::noteOnDispatch(int delay, int noteNumber, float velocity) noex
         }
     }
 
+    // A pipe gives one sound: its new attack ends its earlier tails, once per stop.
+    std::array<uint64_t, 2> restruck { 0, 0 };
     for (Layer* layer : noteActivationLists_[noteNumber]) {
         if ((layer->getRegion().divMask & dispatchDivMask_) == 0)   // DivisionGate.h
             continue;
@@ -2245,6 +2338,11 @@ void Synth::Impl::noteOnDispatch(int delay, int noteNumber, float velocity) noex
                 continue;
 
             checkOffGroups(&region, delay, noteNumber);
+            if (region.trigger == Trigger::attack && gateCc >= 0 && gateCc < 128
+                && !((restruck[gateCc >> 6] >> (gateCc & 63)) & 1u)) {
+                restruck[gateCc >> 6] |= uint64_t { 1 } << (gateCc & 63);
+                endRestruckTails(region, delay, noteNumber);
+            }
             TriggerEvent triggerEvent { TriggerEventType::NoteOn, noteNumber, velocity };
             Voice* voice = startVoice(layer, delay, triggerEvent, ring);
             if (voice && early && region.trigger == Trigger::attack && !region.isOscillator()

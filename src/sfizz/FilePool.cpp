@@ -162,8 +162,9 @@ extern "C" void sfizz_stream_cache(int64_t* out)
 
 // The cache budget (design 4f): released streamed files are kept while their bytes fit in
 // it, and over it the ones idle longest are freed first. -1 = sfizz's rule (free what has
-// been idle fileClearingPeriod). Set by the app from what the heads leave spare; lowered on
-// onTrimMemory, which also asks for a pass at once.
+// been idle fileClearingPeriod). The files being read count in it: the app sets its room for
+// them plus what the heads leave spare; lowered on onTrimMemory, which also asks for a pass
+// at once.
 namespace {
 std::atomic<int64_t> cacheBudgetBytes { -1 };
 std::atomic<bool> collectRequested { false };
@@ -1336,7 +1337,7 @@ void sfz::FilePool::setRamLoading(bool loadInRam) noexcept
 
 // The budget's pass (design 4f). Called with garbageAndLastUsedMutex held, on the audio
 // thread: no allocation (gcCandidates is reserved like lastUsedFiles). Files a voice reads
-// are kept whatever the budget (the active streams, a separate term in the app's sum).
+// are kept whatever the budget (the app's limit holds their room).
 void sfz::FilePool::collectOverBudget(int64_t budget, int& keptReading, int& keptRecent, int& freed) noexcept
 {
     gcCandidates.clear();

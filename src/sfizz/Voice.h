@@ -469,6 +469,25 @@ public:
     void setReleaseGainScale(float scale) noexcept;
 
     /**
+     * @brief A re-struck pipe (RESTRIKE_HANDOVER_DESIGN.md §4). On a tail voice: the full
+     * level of the pipe it continues, in power-follower units (0 = not known), the scale it
+     * was started at (setReleaseGainScale), and its level now (the unsmoothed power over at
+     * least `frames` output frames). On an attack
+     * voice: start at this source frame, no further in than the frames the voice would play
+     * before asking for its stream (whole periods of `period` back), which it then asks for
+     * that much sooner. Cleared every reset().
+     */
+    void setTailFullLevel(float full) noexcept;
+    float getTailFullLevel() const noexcept;
+    float getTailScale() const noexcept;
+    float getRecentPower(float frames) const noexcept;
+    void setAttackStartOverride(int sourceFrame, float period) noexcept;
+    // Source frames read per output frame.
+    float getSourceRatio() const noexcept;
+    // Fade out linearly over `seconds` from `delay`, and count as offed.
+    void fadeOut(int delay, float seconds) noexcept;
+
+    /**
      * @brief Division mask of the note event that started this voice (Jukkasjarvi
      * manual assignment, DivisionGate.h): a note-off only releases voices whose mask
      * intersects the event's, so the same key held on two manuals releases

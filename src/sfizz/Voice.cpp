@@ -310,6 +310,10 @@ struct Voice::Impl
     int sourcePosition_ { 0 };
     int releaseStartOverride_ { -1 };   // >=0: phase-aligned release start (ReleaseAlign.h)
     float releaseGainScale_ { 1.0f };   // release tail scaled to note's level at release
+    float tailFull_ { 0.0f };           // a tail's pipe's full level (RESTRIKE_HANDOVER_DESIGN.md)
+    float tailScale_ { 1.0f };          // and the scale it was started at
+    int attackStartOverride_ { -1 };    // >=0: a re-struck pipe enters its attack here
+    float attackStartPeriod_ { 0.0f };
     uint32_t divMask_ { 0xFFFFFFFFu };  // division of the starting note event (DivisionGate.h)
     int gateCc_ { -1 };                 // starting region's stop gate CC (live registration)
     const Layer* compositeLayer_ { nullptr };   // composite attack this voice plays (Composite.h)
@@ -602,6 +606,27 @@ bool Voice::startVoice(Layer* layer, int delay, const TriggerEvent& event) noexc
     impl.streamRequestAt_ = static_cast<int>(streamRequestDelay() * impl.sampleRate_
                                              / max(impl.pitchRatio_, 1e-3f));
 
+    // A re-struck pipe enters its attack where it is as loud as its tail
+    // (RESTRIKE_HANDOVER_DESIGN.md §4). A head is its stream's need plus a slack, the frames
+    // played before the stream is asked for: enter no further in than that, in whole periods
+    // so the phase holds, and ask that much sooner. A file held whole has no such bound.
+    if (impl.attackStartOverride_ >= 0 && !region.isRelease() && impl.currentPromise_) {
+        const double ratio = max(static_cast<double>(impl.pitchRatio_ * impl.speedRatio_), 1e-3);
+        const int64_t end = static_cast<int64_t>(impl.currentPromise_->information.end) - 256;
+        const bool whole = static_cast<int64_t>(impl.currentPromise_->headFrames()) >= end;
+        const int64_t slack = whole ? end
+            : impl.streamRequested_ ? 0 : static_cast<int64_t>(impl.streamRequestAt_ * ratio);
+        int64_t g = impl.attackStartOverride_;
+        const int64_t p = static_cast<int64_t>(std::lround(impl.attackStartPeriod_));
+        if (g > slack && p > 0)
+            g -= (g - slack + p - 1) / p * p;
+        g = max(int64_t { 0 }, min(g, max(int64_t { 0 }, end)));
+        impl.sourcePosition_ = static_cast<int>(g);
+        if (!whole && !impl.streamRequested_)
+            impl.streamRequestAt_ = max(0, impl.streamRequestAt_ - static_cast<int>(std::ceil(g / ratio)));
+    }
+    impl.attackStartOverride_ = -1;
+
     // A tail whose stream was asked at its note-on and is not decoded yet: it now has a
     // deadline, its start (design 9d). It reads from its aligned start, not from frame 0.
     if (region.isRelease() && !impl.streamRequested_ && !region.isOscillator() && impl.currentPromise_)
@@ -616,6 +641,7 @@ bool Voice::startVoice(Layer* layer, int delay, const TriggerEvent& event) noexc
     // Release-tail crossfade (ReleaseAlign.h): scale this release voice to the note's level
     // at release so a half-spoken note gets a half-level tail (no swell on slow-onset pipes).
     impl.baseGain_ *= impl.releaseGainScale_;
+    impl.tailScale_ = impl.releaseGainScale_;
     impl.releaseGainScale_ = 1.0f;
 
     impl.gainSmoother_.reset();
@@ -2178,6 +2204,9 @@ void Voice::reset() noexcept
     impl.sourcePosition_ = 0;
     impl.releaseStartOverride_ = -1;
     impl.releaseGainScale_ = 1.0f;
+    impl.tailFull_ = 0.0f;
+    impl.tailScale_ = 1.0f;
+    impl.attackStartOverride_ = -1;
     impl.divMask_ = 0xFFFFFFFFu;
     impl.gateCc_ = -1;
     impl.compositeLayer_ = nullptr;
@@ -2597,6 +2626,53 @@ void Voice::setReleaseStartOverride(int sourceFrame) noexcept
 void Voice::setReleaseGainScale(float scale) noexcept
 {
     impl_->releaseGainScale_ = scale;
+}
+
+void Voice::setTailFullLevel(float full) noexcept
+{
+    impl_->tailFull_ = full;
+}
+
+float Voice::getTailFullLevel() const noexcept
+{
+    return impl_->tailFull_;
+}
+
+float Voice::getTailScale() const noexcept
+{
+    return impl_->tailScale_;
+}
+
+float Voice::getRecentPower(float frames) const noexcept
+{
+    const float steps = std::ceil(max(frames, 1.0f) / static_cast<float>(config::powerFollowerStep));
+    return impl_->powerFollower_.getRecentPower(static_cast<size_t>(steps));
+}
+
+void Voice::setAttackStartOverride(int sourceFrame, float period) noexcept
+{
+    impl_->attackStartOverride_ = sourceFrame;
+    impl_->attackStartPeriod_ = period;
+}
+
+float Voice::getSourceRatio() const noexcept
+{
+    return impl_->pitchRatio_ * impl_->speedRatio_;
+}
+
+void Voice::fadeOut(int delay, float seconds) noexcept
+{
+    Impl& impl = *impl_;
+    if (impl.region_ == nullptr)
+        return;
+    if (impl.region_->flexAmpEG) {
+        impl.off(delay, true);
+        return;
+    }
+    impl.egAmplitude_.setLinearReleaseTime(seconds);
+    impl.egAmplitude_.stopDynamicUpdates();
+    impl.offed_ = true;
+    impl.release(delay);
 }
 
 void Voice::setDivisionMask(uint32_t mask) noexcept

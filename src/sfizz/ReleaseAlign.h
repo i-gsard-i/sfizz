@@ -35,6 +35,18 @@ void sfizz_release_align_set(const char* attackSample, float period, int anchor,
 // loop_start: a pipe recorded in a church drifts, so elsewhere the tail would start at a
 // near-random phase. Returns the number of points, 0 if the column is not understood.
 int sfizz_release_align_set_track(const char* attackSample, const char* column);
+// Attach the attack's onset levels to an entry already set (docs/design/RESTRIKE_HANDOVER_DESIGN.md
+// §4): the tsv's seventh column, "o1:" + base64 of one byte per period from frame 0, the byte
+// being the (L+R) RMS over that period in 1/255 of loopRms, up to the first period that
+// reaches it. Returns the number of periods, 0 if the column is not understood.
+int sfizz_release_align_set_onset(const char* attackSample, const char* column);
+// Attach the attack's tail track to an entry already set (RESTRIKE_HANDOVER_DESIGN.md §4): the
+// tsv's eighth column, "t2:" + base64 of the first point's 3 bytes, then 2 per further point.
+// Point i is at tail frame round(period)*i, its value the attack frame to enter at, in level and
+// phase, when the tail is there at its recorded level; after the first, each is stored as its
+// step from the one before minus round(period), signed 16-bit, little-endian. The track ends
+// where the tail falls below 1/255 of loopRms. Returns the number of points, 0 if not understood.
+int sfizz_release_align_set_tail(const char* attackSample, const char* column);
 // Drop all entries (call before re-registering on a fresh organ load).
 void sfizz_release_align_clear();
 // Master enable, driven by the app's "Release tails" toggle. Default OFF -> byte-identical
@@ -53,6 +65,13 @@ void sfizz_release_align_set_fallback(float seconds);
 // trigger=release voice is faded out so it is silent `seconds` after it starts. 0 = the
 // recorded tails play whole (default). Live: read by each release voice as it renders.
 void sfizz_release_tail_cut(float seconds);
+// "A re-struck pipe ends its tail" (organdroid, docs/design/RESTRIKE_HANDOVER_DESIGN.md): one pipe
+// gives one sound, so its new attack can end the tails its earlier strokes left ringing
+// (same stop_cc, same key), over sfizz's fast off time. A tail is the pipe's dying speech
+// plus, in a wet recording, the room's decay, which really goes on; the samples do not
+// separate them. 0 = by organ (only a region with organdroid_wet=0), 1 = always,
+// 2 = never (default 0). Live: read at each note-on.
+void sfizz_restrike_ends_tails(int mode);
 }
 
 namespace sfz {
@@ -75,6 +94,9 @@ float releaseAlignFallback() noexcept;
 // Release-tail cut in seconds, 0 = none (see setter above).
 float releaseTailCut() noexcept;
 
+// Whether a re-strike of `tail`'s pipe ends it (see sfizz_restrike_ends_tails).
+bool restrikeEndsTail(bool wet) noexcept;
+
 // On hit, fills period/anchor (source frames) + loopRms and returns true. track/trackSize
 // get the entry's phase track (nullptr/0 if it has none); valid until the next clear.
 bool releaseAlignLookup(const std::string& attackSample, float& period, int& anchor, float& loopRms,
@@ -83,5 +105,19 @@ bool releaseAlignLookup(const std::string& attackSample, float& period, int& anc
 // Correction (source frames) the phase track adds at source position `pos`: the nearest
 // point's byte * period / 256. 0 without a track.
 float releaseAlignTrackCorrection(const uint8_t* track, size_t trackSize, float period, int64_t pos) noexcept;
+
+// The attack's onset levels (see sfizz_release_align_set_onset); false without them.
+bool releaseAlignOnset(const std::string& attackSample, const uint8_t*& onset, size_t& onsetSize);
+
+// The source frame where the attack is first as loud as `level` (of its full level): the
+// start of the first period whose onset level reaches it, or the end of the onset.
+int64_t restrikeEntry(const uint8_t* onset, size_t onsetSize, float period, float level) noexcept;
+
+// The attack's tail track (see sfizz_release_align_set_tail), in bytes; false without it.
+bool releaseAlignTail(const std::string& attackSample, const uint8_t*& tail, size_t& tailSize);
+
+// The attack frame to enter at when the tail is at frame `pos`: the nearest point's, plus the
+// frames since it. -1 without points or past the last (the tail is then cut).
+int64_t restrikeTailEntry(const uint8_t* tail, size_t tailSize, float period, int64_t pos) noexcept;
 
 } // namespace sfz

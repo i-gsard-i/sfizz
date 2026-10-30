@@ -70,6 +70,9 @@ void PowerFollower::process(AudioSpan<float> buffer) noexcept
                 currentPower * releaseFactor + meanPower * (1 - releaseFactor));
             currentSum = 0;
             currentCount = 0;
+            recent_[recentNext_] = meanPower;
+            recentNext_ = (recentNext_ + 1) % kRecentSteps;
+            recentFilled_ = std::min(recentFilled_ + 1, kRecentSteps);
         }
 
         index += blockSize;
@@ -86,6 +89,21 @@ void PowerFollower::copyScaledFrom(const PowerFollower& other, float weight) noe
     currentPower_ = other.currentPower_ * weight;
     currentSum_ = other.currentSum_ * weight;
     currentCount_ = other.currentCount_;
+    for (size_t i = 0; i < kRecentSteps; ++i)
+        recent_[i] = other.recent_[i] * weight;
+    recentNext_ = other.recentNext_;
+    recentFilled_ = other.recentFilled_;
+}
+
+float PowerFollower::getRecentPower(size_t steps) const noexcept
+{
+    const size_t n = std::min(std::max<size_t>(steps, 1), recentFilled_);
+    if (n == 0)
+        return currentPower_;
+    float sum = 0.0f;
+    for (size_t i = 1; i <= n; ++i)
+        sum += recent_[(recentNext_ + kRecentSteps - i) % kRecentSteps];
+    return sum / static_cast<float>(n);
 }
 
 void PowerFollower::clear() noexcept
@@ -93,6 +111,9 @@ void PowerFollower::clear() noexcept
     currentPower_ = 0;
     currentSum_ = 0;
     currentCount_ = 0;
+    recent_.fill(0.0f);
+    recentNext_ = 0;
+    recentFilled_ = 0;
 }
 
 void PowerFollower::updateTrackingFactor() noexcept

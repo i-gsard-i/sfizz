@@ -301,6 +301,9 @@ struct Synth::Impl final: public Parser::Listener {
      * @param number
      */
     void checkOffGroups(const Region* region, int delay, int number, bool chokedByCC = false);
+    // A pipe struck again ends its earlier tails (ReleaseAlign.h, sfizz_restrike_ends_tails):
+    // the loudest hands over to `attack` (RESTRIKE_HANDOVER_DESIGN.md §4), the others are cut.
+    void endRestruckTails(const Region& attack, int delay, int number) noexcept;
 
     /**
      * @brief Resets the callback duration breakdown to 0
@@ -447,6 +450,8 @@ struct Synth::Impl final: public Parser::Listener {
     uint32_t pacingSerial_ { 0 };
     bool pacingDispatch_ { false };   // a paced note-off dispatching: not queued again
     bool handingOver_ { false };      // a composite's members starting (handOverComposite)
+    int restrikeStart_ { -1 };        // the next attack voice's entry (endRestruckTails), -1 none
+    float restrikePeriod_ { 0.0f };
     // Set while a paced note-off dispatches: the stops (one bit per gate CC) it leaves
     // sounding, their voices and tails, for a later per-stop note-off.
     uint64_t dispatchDeferCc_[2] {};

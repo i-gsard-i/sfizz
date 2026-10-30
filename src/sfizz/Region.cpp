@@ -201,6 +201,12 @@ bool sfz::Region::parseOpcode(const Opcode& rawOpcode, bool cleanOpcode)
             gateCc = cc;
         break;
     }
+    case hash("organdroid_wet"): { // re-strike ends tails (ReleaseAlign.h)
+        int on {};
+        if (absl::SimpleAtoi(opcode.value, &on))
+            wet = on != 0;
+        break;
+    }
     case hash("composite"): { // composite stops (Composite.h)
         int id {};
         if (absl::SimpleAtoi(opcode.value, &id) && id >= 0)
