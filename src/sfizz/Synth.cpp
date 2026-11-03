@@ -5,6 +5,7 @@
 // If not, contact the sfizz maintainers at https://github.com/sfztools/sfizz
 
 #include "SynthPrivate.h"
+#include "sfizz_private.hpp"
 #include "Config.h"
 #include "utility/Debug.h"
 #include "utility/Macros.h"
@@ -724,8 +725,9 @@ void Synth::Impl::finalizeSfzLoad()
     size_t currentRegionIndex = 0;
     size_t currentRegionCount = layers_.size();
 
-    // per file: the largest offset, and the head its regions ask for (0 = the pool's size)
-    absl::flat_hash_map<sfz::FileId, std::pair<int64_t, int64_t>> filesToLoad;
+    // organdroid: per file, its largest offset, its head and the head it grows to (design §10).
+    struct FileToLoad { int64_t first { 0 }; int64_t head { 0 }; int64_t grow { 0 }; };
+    absl::flat_hash_map<sfz::FileId, FileToLoad> filesToLoad;
 
     auto removeCurrentRegion = [this, &currentRegionIndex, &currentRegionCount]() {
         const Region& region = layers_[currentRegionIndex]->getRegion();
@@ -822,7 +824,8 @@ void Synth::Impl::finalizeSfzLoad()
 
             auto& toLoad = filesToLoad[*region.sampleId];
             toLoad.first = max(toLoad.first, maxOffset);
-            toLoad.second = max(toLoad.second, region.headFrames);
+            toLoad.head = max(toLoad.head, region.headFrames);
+            toLoad.grow = max(toLoad.grow, region.growFrames);
         }
         else if (!region.isGenerator()) {
             if (!wavePool.createFileWave(filePool, std::string(region.sampleId->filename()))) {
@@ -928,7 +931,8 @@ void Synth::Impl::finalizeSfzLoad()
         preloadList.reserve(filesToLoad.size());
         for (const auto& toLoad: filesToLoad)
             preloadList.push_back({ toLoad.first, static_cast<uint32_t>(toLoad.second.first),
-                                    static_cast<uint32_t>(toLoad.second.second) });
+                                    static_cast<uint32_t>(toLoad.second.head),
+                                    static_cast<uint32_t>(toLoad.second.grow) });
         filePool.preloadFiles(preloadList);
     }
 
@@ -3382,3 +3386,15 @@ const Resources& Synth::getResources() const noexcept
 }
 
 } // namespace sfz
+
+// organdroid (STREAMING_SAFETY_DESIGN.md 10): this palette's heads grow in the background
+// after its load; returns the bytes to grow. Stop waits for the chunks being decoded.
+extern "C" int64_t sfizz_grow_heads_start(sfizz_synth_t* synth)
+{
+    return synth->synth.getResources().getFilePool().startGrowth();
+}
+
+extern "C" void sfizz_grow_heads_stop(sfizz_synth_t* synth)
+{
+    synth->synth.getResources().getFilePool().stopGrowth();
+}

@@ -241,6 +241,7 @@ struct Region {
     int64_t offset { Default::offset }; // offset
     int64_t offsetRandom { Default::offsetRandom }; // offset_random
     int64_t headFrames { Default::headFrames }; // organdroid_head: preload frames, 0 = the pool's
+    int64_t growFrames { Default::headFrames }; // organdroid_head_grow: grown to after the load, 0 = no growth
     CCMap<int64_t> offsetCC { Default::offsetMod };
     int64_t sampleEnd { Default::sampleEnd }; // end
     CCMap<int64_t> endCC { Default::sampleEndMod };

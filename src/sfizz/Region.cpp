@@ -103,6 +103,9 @@ bool sfz::Region::parseOpcode(const Opcode& rawOpcode, bool cleanOpcode)
     case hash("organdroid_head"):   // the app's per-stop head (STREAMING_SAFETY_DESIGN.md 4c)
         headFrames = opcode.read(Default::headFrames);
         break;
+    case hash("organdroid_head_grow"):   // the head it grows to after the load (design §10)
+        growFrames = opcode.read(Default::headFrames);
+        break;
     case hash("offset_oncc&"): // also offset_cc&
         if (opcode.parameters.back() > config::numCCs)
             return false;

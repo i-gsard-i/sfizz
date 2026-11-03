@@ -112,6 +112,7 @@ struct FileData
     FileData(FileAudioBuffer preloaded, FileInformation info)
     : preloadedData(std::move(preloaded)), information(std::move(info))
     {
+        headReady.store(preloadedData.getNumFrames());
 
     }
     FileSource getData()
@@ -123,30 +124,43 @@ struct FileData
         // begins with those frames. Reloaded shorter or as floats (the preload probe), the
         // tail has a gap before it, and the head is read alone.
         // (The buffers are only looked at once available says the stream has started.)
-        const auto tailFollows = [this] { return packedTail.getNumFrames() == 0 || packedHead.getNumFrames() >= tailStart; };
-        if (status != Status::GarbageCollecting && available > headFrames() && tailFollows() && !streamsWithheld()) {
+        // A head growing in place (design §10) is read up to what is published, never past.
+        const size_t head = headFrames();
+        const auto tailFollows = [&] { return packedTail.getNumFrames() == 0 || head >= tailStart; };
+        if (status != Status::GarbageCollecting && available > head && tailFollows() && !streamsWithheld()) {
             if (packedTail.getNumFrames() == 0)
                 source.data = AudioSpan<const float>(fileData).first(available);
             else {
-                source.packed = AudioSpan<const int16_t>(packedHead);
+                source.packed = AudioSpan<const int16_t>(packedHead).first(head);
                 source.tail = AudioSpan<const int16_t>(packedTail).first(available - tailStart);
                 source.tailStart = tailStart;
             }
         } else if (packedHead.getNumFrames() > 0)
-            source.packed = AudioSpan<const int16_t>(packedHead);
+            source.packed = AudioSpan<const int16_t>(packedHead).first(head);
         else
-            source.data = AudioSpan<const float>(preloadedData);
+            source.data = AudioSpan<const float>(preloadedData).first(head);
         return source;
     }
 
+    // The head's frames that can be read: all of its buffer, unless it grows in place
+    // (design §10), when the frames past this are not decoded yet.
     size_t headFrames() const noexcept
+    {
+        return headReady.load(std::memory_order_acquire);
+    }
+    // The head's buffer, what it grows to.
+    size_t headCapacity() const noexcept
     {
         return packedHead.getNumFrames() > 0 ? packedHead.getNumFrames() : preloadedData.getNumFrames();
     }
 
     // Takes a freshly read head: packed when every sample is a 16-bit value (and the file
-    // is not a wavetable, read as floats elsewhere), kept as floats otherwise.
-    void setHead(FileAudioBuffer&& head) noexcept;
+    // is not a wavetable, read as floats elsewhere), kept as floats otherwise. With
+    // [capacity] past its frames, the buffer is made that long for the head to grow into
+    // (design §10), its frames past the head left untouched (calloc's zero pages, which
+    // cost no RAM until written); a packed one only when [sixteenBit], the file's own
+    // depth, since a head that starts in silence packs whatever the file is.
+    void setHead(FileAudioBuffer&& head, size_t capacity = 0, bool sixteenBit = false) noexcept;
 
     FileData(const FileData& other) = delete;
     FileData& operator=(const FileData& other) = delete;
@@ -161,6 +175,7 @@ struct FileData
         tailStart = other.tailStart;
         preloadCallCount = other.preloadCallCount;
         availableFrames = other.availableFrames.load();
+        headReady = other.headReady.load();
         lastViewerLeftAt = other.lastViewerLeftAt;
         status = other.status.load();
     }
@@ -175,6 +190,7 @@ struct FileData
         tailStart = other.tailStart;
         preloadCallCount = other.preloadCallCount;
         availableFrames = other.availableFrames.load();
+        headReady = other.headReady.load();
         lastViewerLeftAt = other.lastViewerLeftAt;
         status = other.status.load();
         return *this;
@@ -188,8 +204,12 @@ struct FileData
     size_t tailStart { 0 };              // the head's length when packedTail was started
     int preloadCallCount { 0 };
     std::atomic<Status> status { Status::Invalid };
-    bool fullyLoaded { false };
+    // Written by a head that grows to the whole file (design §10) while voices read it.
+    std::atomic<bool> fullyLoaded { false };
     std::atomic<size_t> availableFrames { 0 };
+    // The head's frames decoded and readable (design §10): published by the growth after
+    // it writes them (release), read by voices (acquire). Its buffer's length otherwise.
+    std::atomic<size_t> headReady { 0 };
     std::atomic<int> readerCount { 0 };
     // organdroid (design 9c): its stream was asked as a certain tail, with no deadline yet;
     // the first request with one moves it up (FilePool::queueStream).
@@ -308,13 +328,14 @@ public:
      * @return true if the preloading went fine
      * @return false if something went wrong ()
      */
-    bool preloadFile(const FileId& fileId, uint32_t maxOffset, uint32_t headFrames = 0) noexcept;
+    bool preloadFile(const FileId& fileId, uint32_t maxOffset, uint32_t headFrames = 0, uint32_t growFrames = 0) noexcept;
 
     /** A file to preload: its largest offset, and its head past it (0 = preloadSize). */
     struct PreloadRequest {
         FileId id;
         uint32_t maxOffset;
         uint32_t headFrames;
+        uint32_t growFrames { 0 };   // the head past maxOffset it grows to, 0 = none (design §10)
     };
 
     /**
@@ -454,6 +475,15 @@ public:
      */
     void triggerGarbageCollection() noexcept;
 
+    /**
+     * organdroid (design §10): grow every head whose buffer has room (organdroid_head_grow)
+     * in the background, on the stream threads after every other stream. Returns the bytes
+     * to grow (0: nothing). Progress: sfizz_grow_heads_progress().
+     */
+    int64_t startGrowth() noexcept;
+    /** Stop growing and wait for the chunks being decoded. The heads stay as grown. */
+    void stopGrowth() noexcept;
+
     /** organdroid: whether the Synth should collect now, [framesSince] frames after the
      *  last pass (every fileClearingPeriod, or every second with a cache budget, or at once
      *  when the app asked: sfizz_collect_streams_now). */
@@ -520,6 +550,10 @@ private:
         // its tail starts: then promoteTo, its start, waits here while a task holds it.
         bool tail { false };
         double promoteTo { -1.0 };
+        // A head growing in place (design §10): ranked after every deadline and every
+        // certain tail, it decodes into the head, not into a stream, up to its buffer.
+        bool grow { false };
+        const FileId* growId { nullptr };
     };
     // Its rank in the queue (9d), under streamsMutex: the deadline, or after them all.
     static double rankOf(const ActiveStream& stream) noexcept;
@@ -531,6 +565,16 @@ private:
     void finishStream(ActiveStream& stream) noexcept;
     void removeStream(ActiveStream* stream) noexcept;
     void enqueueStreamTask() noexcept;
+    // Growth (design §10), under streamsMutex: the heads with room left, in load order, at
+    // most one growing per stream thread.
+    struct GrowItem { const FileId* id; FileData* data; };
+    std::vector<GrowItem> growQueue;
+    size_t growNext { 0 };
+    int growRunning { 0 };
+    int growLimit { 1 };
+    std::atomic<bool> growCancelled { false };
+    void admitGrowthLocked() noexcept;
+    bool growChunk(ActiveStream& stream) noexcept;   // true when done with this head
     double streamClock() const noexcept;
     const std::chrono::steady_clock::time_point streamEpoch { std::chrono::steady_clock::now() };
     std::mutex streamsMutex;

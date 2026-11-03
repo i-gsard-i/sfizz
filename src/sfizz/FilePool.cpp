@@ -298,7 +298,7 @@ sfz::FileAudioBuffer readFromFile(sfz::AudioReader& reader, uint32_t numFrames)
 // The 16-bit values of a float head, or false when a sample is not one (a 24-bit or float
 // recording): then the head stays float, as before. Multiplying by 32768 is exact in
 // float, so the test is exact, and so is the way back (kPackedHeadScale).
-static bool packHead(const sfz::FileAudioBuffer& head, sfz::PackedHeadBuffer& out)
+static bool packHead(const sfz::FileAudioBuffer& head, sfz::PackedHeadBuffer& out, size_t capacity = 0)
 {
     const size_t numFrames = head.getNumFrames();
     const size_t numChannels = head.getNumChannels();
@@ -311,11 +311,12 @@ static bool packHead(const sfz::FileAudioBuffer& head, sfz::PackedHeadBuffer& ou
                 return false;
         }
     }
+    // Fresh buffers are calloc'd (Buffer.h): zeros, padding included, and the pages past
+    // the head of one that grows (design 10) stay unwritten, so they cost no RAM yet.
     out.reset();
-    out.resize(numFrames);
+    out.resize(std::max(numFrames, capacity));
     for (size_t c = 0; c < numChannels; ++c)
         out.addChannel();
-    out.clear();
     for (size_t c = 0; c < numChannels; ++c) {
         const auto from = head.getConstSpan(c);
         const auto to = out.getSpan(c);
@@ -348,18 +349,33 @@ extern "C" void sfizz_head_counts_reset()
     headsFloat.store(0, std::memory_order_relaxed);
 }
 
-void sfz::FileData::setHead(FileAudioBuffer&& head) noexcept
+void sfz::FileData::setHead(FileAudioBuffer&& head, size_t capacity, bool sixteenBit) noexcept
 {
+    const size_t frames = head.getNumFrames();
+    const bool grows = capacity > frames && !information.wavetable && head.getNumChannels() > 0;
     PackedHeadBuffer packed;
-    if (packHeads.load(std::memory_order_relaxed) && !information.wavetable && packHead(head, packed)) {
+    if (packHeads.load(std::memory_order_relaxed) && !information.wavetable && (!grows || sixteenBit)
+        && packHead(head, packed, grows ? capacity : 0)) {
         packedHead = std::move(packed);
         preloadedData.reset();
         headsPacked.fetch_add(1, std::memory_order_relaxed);
+    } else if (grows) {
+        // A float head that grows (design 10): its buffer at the grown length, calloc'd,
+        // the head copied in and the rest left unwritten.
+        FileAudioBuffer big { head.getNumChannels(), capacity };
+        for (size_t c = 0; c < head.getNumChannels(); ++c) {
+            const auto from = head.getConstSpan(c);
+            std::copy(from.begin(), from.end(), big.getSpan(c).begin());
+        }
+        packedHead.reset();
+        preloadedData = std::move(big);
+        headsFloat.fetch_add(1, std::memory_order_relaxed);
     } else {
         packedHead.reset();
         preloadedData = std::move(head);
         headsFloat.fetch_add(1, std::memory_order_relaxed);
     }
+    headReady.store(frames, std::memory_order_release);
 }
 
 sfz::FilePool::FilePool()
@@ -532,7 +548,7 @@ absl::optional<sfz::FileInformation> sfz::FilePool::getFileInformation(const Fil
     return getReaderInformation(reader.get());
 }
 
-bool sfz::FilePool::preloadFile(const FileId& fileId, uint32_t maxOffset, uint32_t headFrames) noexcept
+bool sfz::FilePool::preloadFile(const FileId& fileId, uint32_t maxOffset, uint32_t headFrames, uint32_t growFrames) noexcept
 {
     const auto loadedFile = loadedFiles.find(fileId);
     if (loadedFile != loadedFiles.end()) {
@@ -556,14 +572,17 @@ bool sfz::FilePool::preloadFile(const FileId& fileId, uint32_t maxOffset, uint32
         else
             return min(frames, maxOffset + (headFrames > 0 ? headFrames : preloadSize));
     }();
+    // The head it grows to after the load (design 10), its buffer's length; 0 = none.
+    const uint32_t capacity = !loadInRam && growFrames > 0 ? min(frames, maxOffset + growFrames) : 0;
+    const bool sixteenBit = reader->bitsPerSample() == 16;
 
     const auto existingFile = preloadedFiles.find(fileId);
     if (existingFile != preloadedFiles.end()) {
         auto& fileData = existingFile->second;
-        if (framesToLoad > fileData.headFrames()) {
+        if (framesToLoad > fileData.headFrames() || capacity > fileData.headCapacity()) {
             fileData.information.maxOffset = maxOffset;
             fileData.information.headFrames = headFrames;
-            fileData.setHead(readFromFile(*reader, framesToLoad));
+            fileData.setHead(readFromFile(*reader, framesToLoad), capacity, sixteenBit);
             fileData.fullyLoaded = frames == framesToLoad;
         }
         fileData.preloadCallCount++;
@@ -573,7 +592,7 @@ bool sfz::FilePool::preloadFile(const FileId& fileId, uint32_t maxOffset, uint32
             FileAudioBuffer {},
             *fileInformation
         });
-        insertedPair.first->second.setHead(readFromFile(*reader, framesToLoad));
+        insertedPair.first->second.setHead(readFromFile(*reader, framesToLoad), capacity, sixteenBit);
 
         insertedPair.first->second.preloadCallCount++;
         insertedPair.first->second.status = FileData::Status::Preloaded;
@@ -617,6 +636,7 @@ void sfz::FilePool::preloadFiles(const std::vector<PreloadRequest>& files) noexc
         const FileId* id;
         uint32_t maxOffset;
         uint32_t headFrames;
+        uint32_t growFrames;
         absl::optional<FileInformation> information;
         FileData data;          // the head set in the worker (setHead packs it there)
         bool fullyLoaded { false };
@@ -626,13 +646,14 @@ void sfz::FilePool::preloadFiles(const std::vector<PreloadRequest>& files) noexc
     jobs.reserve(files.size());
     for (const auto& item : files) {
         if (loadedFiles.contains(item.id) || preloadedFiles.contains(item.id)) {
-            preloadFile(item.id, item.maxOffset, item.headFrames);
+            preloadFile(item.id, item.maxOffset, item.headFrames, item.growFrames);
             preloadProgressDone.fetch_add(1, std::memory_order_relaxed);
         } else {
             jobs.emplace_back();
             jobs.back().id = &item.id;
             jobs.back().maxOffset = item.maxOffset;
             jobs.back().headFrames = item.headFrames;
+            jobs.back().growFrames = item.growFrames;
         }
     }
 
@@ -662,8 +683,11 @@ void sfz::FilePool::preloadFiles(const std::vector<PreloadRequest>& files) noexc
                         const auto frames = static_cast<uint32_t>(reader->frames());
                         const auto framesToLoad = loadInRam ? frames
                             : min(frames, job.maxOffset + (job.headFrames > 0 ? job.headFrames : preloadSize));
+                        const auto capacity = !loadInRam && job.growFrames > 0
+                            ? min(frames, job.maxOffset + job.growFrames) : 0;
                         job.data.information = *information;
-                        job.data.setHead(readFromFile(*reader, framesToLoad));
+                        job.data.setHead(readFromFile(*reader, framesToLoad), capacity,
+                                         reader->bitsPerSample() == 16);
                         job.fullyLoaded = framesToLoad == frames;
                         job.information = information;
                         job.ok = true;
@@ -856,6 +880,7 @@ void sfz::FilePool::queueStream(const std::shared_ptr<FileId>& fileId, FileData&
 
 void sfz::FilePool::setPreloadSize(uint32_t preloadSize) noexcept
 {
+    stopGrowth();   // every head is read again, at one size
     this->preloadSize = preloadSize;
     if (loadInRam)
         return;
@@ -936,6 +961,167 @@ extern "C" void sfizz_stream_verify_counts(int* ok, int* bad)
     if (bad) *bad = streamsMismatched.load();
 }
 
+// ---- Heads that grow after the load (organdroid, STREAMING_SAFETY_DESIGN.md 10) ----
+// The load decodes each head to its floor into a buffer as long as it will grow
+// (organdroid_head_grow; FileData::setHead). Afterwards the stream threads fill the rest,
+// one chunk per task, ranked after every stream (rankOf), and publish each chunk by the
+// head's length (headReady): a voice reads up to it, a stream starts after it. Nothing is
+// moved or freed while voices play. Process-wide counters, as the preload's: one palette
+// grows at a time.
+
+namespace {
+std::atomic<int64_t> growBytesTotal { 0 };
+std::atomic<int64_t> growBytesDone { 0 };
+std::atomic<int> growHeadsLeft { 0 };     // queued or growing
+std::atomic<int> growHeadsFailed { 0 };   // stopped short (a frame not 16-bit, a reader)
+std::atomic<int> growHeadsTotal { 0 };
+
+size_t headFrameBytes(const sfz::FileData& d)
+{
+    return d.packedHead.getNumFrames() > 0 ? d.packedHead.getNumChannels() * sizeof(int16_t)
+                                           : d.preloadedData.getNumChannels() * sizeof(float);
+}
+} // namespace
+
+// out: {bytes grown, bytes to grow, heads left, heads stopped short, heads}
+extern "C" void sfizz_grow_heads_progress(int64_t* out)
+{
+    out[0] = growBytesDone.load(std::memory_order_relaxed);
+    out[1] = growBytesTotal.load(std::memory_order_relaxed);
+    out[2] = growHeadsLeft.load(std::memory_order_relaxed);
+    out[3] = growHeadsFailed.load(std::memory_order_relaxed);
+    out[4] = growHeadsTotal.load(std::memory_order_relaxed);
+}
+
+int64_t sfz::FilePool::startGrowth() noexcept
+{
+    stopGrowth();
+    std::lock_guard<std::mutex> lock { streamsMutex };
+    growQueue.clear();
+    growNext = 0;
+    int64_t bytes = 0;
+    // In the map's order: the request moment changes only when every head is grown
+    // (design 10c), so the order does not matter for safety.
+    for (auto& f : preloadedFiles) {
+        FileData& d = f.second;
+        const size_t ready = d.headFrames();
+        const size_t capacity = d.headCapacity();
+        if (capacity <= ready || d.information.wavetable || f.first.isReverse())
+            continue;
+        growQueue.push_back({ &f.first, &d });
+        bytes += static_cast<int64_t>((capacity - ready) * headFrameBytes(d));
+    }
+    growBytesTotal.store(bytes);
+    growBytesDone.store(0);
+    growHeadsFailed.store(0);
+    growHeadsTotal.store(static_cast<int>(growQueue.size()));
+    growHeadsLeft.store(static_cast<int>(growQueue.size()));
+    growLimit = static_cast<int>(std::max(1u, decodeThreadCount()));
+    growCancelled.store(false);
+    admitGrowthLocked();
+    return bytes;
+}
+
+void sfz::FilePool::stopGrowth() noexcept
+{
+    growCancelled.store(true);
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lock { streamsMutex };
+            growNext = growQueue.size();   // nothing more admitted
+            if (growRunning == 0) {
+                growQueue.clear();
+                growNext = 0;
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    growHeadsLeft.store(0);
+}
+
+void sfz::FilePool::admitGrowthLocked() noexcept
+{
+    while (!growCancelled.load() && !streamsCancelled.load()
+           && growRunning < growLimit && growNext < growQueue.size()) {
+        const GrowItem item = growQueue[growNext++];
+        auto stream = std::unique_ptr<ActiveStream>(new ActiveStream);
+        stream->data = item.data;
+        stream->grow = true;
+        stream->growId = item.id;
+        activeStreams.push_back(std::move(stream));
+        ++growRunning;
+        streamTasks.fetch_add(1);
+        enqueueStreamTask();
+    }
+}
+
+bool sfz::FilePool::growChunk(ActiveStream& stream) noexcept
+{
+    FileData& data = *stream.data;
+    const bool packed = data.packedHead.getNumFrames() > 0;
+    const size_t frameBytes = headFrameBytes(data);
+    const auto fail = [&] {
+        growHeadsFailed.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    };
+    if (!stream.started) {
+        std::error_code readError;
+        AudioReaderPtr reader = createAudioReader(rootDirectory / stream.growId->filename(), false, &readError);
+        if (readError || !reader)
+            return fail();
+        const size_t ready = data.headFrames();
+        const unsigned channels = packed ? data.packedHead.getNumChannels() : data.preloadedData.getNumChannels();
+        if (reader->channels() != channels || (packed && reader->bitsPerSample() != 16)
+            || ready == 0 || !reader->seek(ready))
+            return fail();
+        stream.numFrames = std::min(data.headCapacity(), static_cast<size_t>(reader->frames()));
+        stream.position = ready;
+        stream.packed = packed;
+        stream.reader = std::move(reader);
+        stream.started = true;
+        if (stream.position >= stream.numFrames)
+            return true;
+    }
+
+    const unsigned numChannels = stream.reader->channels();
+    thread_local sfz::Buffer<float> block;
+    const size_t want = std::min(kStreamChunkFrames, stream.numFrames - stream.position);
+    if (block.size() < want * numChannels)
+        block.resize(kStreamChunkFrames * std::max(2u, numChannels));
+    const size_t got = stream.reader->readNextBlock(block.data(), want);
+    if (packed) {
+        // Exact as the load's packing: a frame that is no 16-bit value stops the growth
+        // there, the head valid as far as it is published.
+        for (size_t i = 0; i < got * numChannels; ++i) {
+            const float k = block[i] * 32768.0f;
+            if (!(k >= -32768.0f && k <= 32767.0f) || k != std::nearbyint(k))
+                return fail();
+        }
+    }
+    for (unsigned c = 0; c < numChannels && got > 0; ++c) {
+        if (packed) {
+            const auto to = data.packedHead.getSpan(c).subspan(stream.position, got);
+            for (size_t i = 0; i < got; ++i)
+                to[i] = static_cast<int16_t>(block[i * numChannels + c] * 32768.0f);
+        } else {
+            const auto to = data.preloadedData.getSpan(c).subspan(stream.position, got);
+            for (size_t i = 0; i < got; ++i)
+                to[i] = block[i * numChannels + c];
+        }
+    }
+    stream.position += got;
+    data.headReady.store(stream.position, std::memory_order_release);
+    growBytesDone.fetch_add(static_cast<int64_t>(got * frameBytes), std::memory_order_relaxed);
+    if (stream.position >= stream.numFrames) {
+        // Whole: nothing of this file streams any more (queueStream).
+        if (stream.numFrames >= static_cast<size_t>(stream.reader->frames()))
+            data.fullyLoaded = true;
+        return true;
+    }
+    return got < want ? fail() : false;
+}
+
 double sfz::FilePool::streamClock() const noexcept
 {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - streamEpoch).count();
@@ -951,6 +1137,10 @@ double sfz::FilePool::rankOf(const ActiveStream& stream) noexcept
     // Every deadline is on the stream clock, seconds since the pool was made: a certain
     // tail's rank, past any of them, keeps the tails in the order they were asked.
     constexpr double kAfterDeadlines { 1e9 };
+    // A growing head (design 10) after the deadlines and the certain tails.
+    constexpr double kAfterTails { 2e9 };
+    if (stream.grow)
+        return kAfterTails;
     return stream.tail ? kAfterDeadlines + stream.startedAt : stream.deadline;
 }
 
@@ -1157,6 +1347,30 @@ void sfz::FilePool::streamChunkTask() noexcept
         return;
     }
 
+    if (stream->grow) {
+        const bool done = streamsCancelled.load() || growCancelled.load() || growChunk(*stream);
+        {
+            std::lock_guard<std::mutex> lock { streamsMutex };
+            if (done) {
+                const auto it = std::find_if(activeStreams.begin(), activeStreams.end(),
+                    [stream](const std::unique_ptr<ActiveStream>& p) { return p.get() == stream; });
+                if (it != activeStreams.end()) {
+                    std::iter_swap(it, activeStreams.end() - 1);
+                    activeStreams.pop_back();
+                }
+                --growRunning;
+                growHeadsLeft.fetch_sub(1, std::memory_order_relaxed);
+                admitGrowthLocked();
+            } else
+                stream->busy = false;
+        }
+        if (done)
+            streamTasks.fetch_sub(1);
+        else
+            enqueueStreamTask();
+        return;
+    }
+
     bool finished = false;
     bool drop = streamsCancelled.load() || stream->id.expired();
     const auto start = std::chrono::steady_clock::now();
@@ -1239,7 +1453,8 @@ void sfz::FilePool::dispatchingJob() noexcept
         {
             std::lock_guard<std::mutex> lock { streamsMutex };
             for (const auto& p : activeStreams) {
-                if (p->data != queuedData.data)
+                // A head growing on the same file is no stream: it serves no voice.
+                if (p->grow || p->data != queuedData.data)
                     continue;
                 skip = true;
                 // A tail started (9d): its stream takes the tail's deadline, now or, while a
@@ -1318,6 +1533,7 @@ void sfz::FilePool::setRamLoading(bool loadInRam) noexcept
         return;
 
     this->loadInRam = loadInRam;
+    stopGrowth();
 
     if (loadInRam) {
         for (auto& preloadedFile : preloadedFiles) {
