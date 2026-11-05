@@ -773,6 +773,21 @@ void Synth::Impl::finalizeSfzLoad()
 
     FlexEGs::clearUnusedCurves();
 
+    {
+        // organdroid: every pipe file's existence check and header read, done ahead on
+        // every core; the pass below then finds them ready (FilePool::prefetchFileInformation).
+        const auto prefetchStart = std::chrono::steady_clock::now();
+        std::vector<FileId> ids;
+        ids.reserve(layers_.size());
+        for (const LayerPtr& layerPtr : layers_) {
+            const Region& region = layerPtr->getRegion();
+            if (!region.isGenerator())
+                ids.push_back(*region.sampleId);
+        }
+        filePool.prefetchFileInformation(ids);
+        infoMicros += loadMicrosSince(prefetchStart);
+    }
+
     while (currentRegionIndex < currentRegionCount) {
         Layer& layer = *layers_[currentRegionIndex];
         Region& region = layer.getRegion();
@@ -968,6 +983,7 @@ void Synth::Impl::finalizeSfzLoad()
                                     static_cast<uint32_t>(toLoad.second.grow) });
         filePool.preloadFiles(preloadList);
     }
+    filePool.clearPrefetched();
     loadTiming[4].store(loadMicrosSince(preloadStart), std::memory_order_relaxed);
     const auto afterStart = std::chrono::steady_clock::now();
 

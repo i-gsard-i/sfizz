@@ -477,6 +477,14 @@ bool sfz::FilePool::checkSampleId(FileId& fileId) const noexcept
     if (loadedFiles.contains(fileId))
         return true;
 
+    const auto prefetched = prefetchedChecks.find(fileId);
+    if (prefetched != prefetchedChecks.end()) {
+        if (!prefetched->second.exists)
+            return false;
+        fileId = FileId(std::string(prefetched->second.filename), fileId.isReverse());
+        return true;
+    }
+
     std::string filename = fileId.filename();
     bool result = checkSample(filename);
     if (result)
@@ -539,6 +547,10 @@ absl::optional<sfz::FileInformation> sfz::FilePool::getFileInformation(const Fil
     if (existingInformation)
         return existingInformation;
 
+    const auto prefetched = prefetchedInformation.find(fileId);
+    if (prefetched != prefetchedInformation.end())
+        return prefetched->second;
+
     const fs::path file { rootDirectory / fileId.filename() };
 
     if (!fs::exists(file))
@@ -546,6 +558,66 @@ absl::optional<sfz::FileInformation> sfz::FilePool::getFileInformation(const Fil
 
     AudioReaderPtr reader = createAudioReader(file, fileId.isReverse());
     return getReaderInformation(reader.get());
+}
+
+void sfz::FilePool::prefetchFileInformation(const std::vector<FileId>& ids) noexcept
+{
+    struct Job {
+        FileId id;
+        bool exists { false };
+        std::string filename;
+        absl::optional<FileInformation> information;
+    };
+    std::vector<Job> jobs;
+    {
+        absl::flat_hash_map<FileId, bool> seen;
+        for (const FileId& id : ids) {
+            if (loadedFiles.contains(id) || preloadedFiles.contains(id) || prefetchedChecks.contains(id))
+                continue;
+            if (!seen.emplace(id, true).second)
+                continue;
+            jobs.push_back(Job { id, false, {}, {} });
+        }
+    }
+    if (jobs.empty())
+        return;
+
+    // What checkSampleId then getFileInformation do for one file, with no shared state
+    // written: checkSample only reads rootDirectory, and readers are per job.
+    ThreadPool pool { decodeThreadCount() };
+    std::vector<std::future<void>> futures;
+    futures.reserve(jobs.size());
+    for (Job& job : jobs) {
+        futures.push_back(pool.enqueue([this, &job] {
+            std::string filename = job.id.filename();
+            if (!checkSample(filename))
+                return;
+            job.exists = true;
+            job.filename = filename;
+            const fs::path file { rootDirectory / filename };
+            std::error_code ec;
+            if (!fs::exists(file, ec))
+                return;
+            AudioReaderPtr reader = createAudioReader(file, job.id.isReverse());
+            job.information = getReaderInformation(reader.get());
+        }));
+    }
+    for (auto& f : futures)
+        f.wait();
+
+    for (Job& job : jobs) {
+        if (job.exists) {
+            FileId checked { std::string(job.filename), job.id.isReverse() };
+            prefetchedInformation.insert_or_assign(checked, job.information);
+        }
+        prefetchedChecks.insert_or_assign(job.id, PrefetchedCheck { job.exists, std::move(job.filename) });
+    }
+}
+
+void sfz::FilePool::clearPrefetched() noexcept
+{
+    prefetchedChecks.clear();
+    prefetchedInformation.clear();
 }
 
 bool sfz::FilePool::preloadFile(const FileId& fileId, uint32_t maxOffset, uint32_t headFrames, uint32_t growFrames) noexcept

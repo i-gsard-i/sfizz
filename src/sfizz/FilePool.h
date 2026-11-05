@@ -320,6 +320,18 @@ public:
     absl::optional<FileInformation> getFileInformation(const FileId& fileId) noexcept;
 
     /**
+     * @brief organdroid: check and read the headers of [ids] ahead, on every core.
+     *
+     * The region pass of a load calls checkSampleId and getFileInformation for each
+     * region, one file at a time; on a phone's shared storage each costs about 1 ms.
+     * This does the same checks and reads for every file not already held, in parallel,
+     * and keeps the answers until clearPrefetched(), so that pass finds them ready. The
+     * answers are the same ones the sequential calls would give.
+     */
+    void prefetchFileInformation(const std::vector<FileId>& ids) noexcept;
+    void clearPrefetched() noexcept;
+
+    /**
      * @brief Preload a file with the proper offset bounds
      *
      * @param fileId
@@ -597,6 +609,12 @@ private:
     // Preloaded data
     absl::flat_hash_map<FileId, FileData> preloadedFiles;
     absl::flat_hash_map<FileId, FileData> loadedFiles;
+
+    // organdroid (prefetchFileInformation): per region FileId as written, whether
+    // checkSample found it and under which name; per checked FileId, its header.
+    struct PrefetchedCheck { bool exists { false }; std::string filename; };
+    absl::flat_hash_map<FileId, PrefetchedCheck> prefetchedChecks;
+    absl::flat_hash_map<FileId, absl::optional<FileInformation>> prefetchedInformation;
     LEAK_DETECTOR(FilePool);
 };
 }
