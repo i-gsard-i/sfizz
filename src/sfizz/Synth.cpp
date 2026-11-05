@@ -38,6 +38,8 @@
 #include "ADSREnvelope.h"
 #include "Interpolators.h"
 #include "parser/Parser.h"
+#include <atomic>
+#include <chrono>
 #include <absl/algorithm/container.h>
 #include <absl/memory/memory.h>
 #include <absl/strings/str_cat.h>
@@ -650,9 +652,29 @@ void Synth::Impl::prepareSfzLoad(const fs::path& path)
     }
 }
 
+// ---- Load timing (organdroid patch) ----
+// Where a palette load's time goes before and around the parallel decode, for the host
+// app's timing line: [0] prepare + parse, [1] the region pass without [2], [2] the pipe
+// files' existence checks and header reads in that pass, [3] how many files that read,
+// [4] preloadFiles (the decode), [5] the rest of finalizeSfzLoad. Microseconds, except [3].
+static std::atomic<int64_t> loadTiming[6] {};
+static int64_t loadMicrosSince(std::chrono::steady_clock::time_point t0)
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+}
+extern "C" void sfizz_load_timing(int64_t* out)
+{
+    for (int i = 0; i < 6; ++i)
+        out[i] = loadTiming[i].load(std::memory_order_relaxed);
+}
+
 bool Synth::loadSfzFile(const fs::path& file)
 {
     Impl& impl = *impl_;
+    for (auto& t : loadTiming)
+        t.store(0, std::memory_order_relaxed);
+    const auto parseStart = std::chrono::steady_clock::now();
     impl.prepareSfzLoad(file);
 
     std::error_code ec;
@@ -660,6 +682,7 @@ bool Synth::loadSfzFile(const fs::path& file)
     bool success = true;
     Parser& parser = impl.parser_;
     parser.parseFile(ec ? file : realFile);
+    loadTiming[0].store(loadMicrosSince(parseStart), std::memory_order_relaxed);
 
     // permissive parsing for compatibility
     if (!loaderParsesPermissively)
@@ -713,6 +736,8 @@ void Synth::Impl::setCurrentSwitch(uint8_t noteValue)
 
 void Synth::Impl::finalizeSfzLoad()
 {
+    const auto regionsStart = std::chrono::steady_clock::now();
+    int64_t infoMicros = 0, infoFiles = 0;
     FilePool& filePool = resources_.getFilePool();
     WavetablePool& wavePool = resources_.getWavePool();
 
@@ -755,12 +780,16 @@ void Synth::Impl::finalizeSfzLoad()
         absl::optional<FileInformation> fileInformation;
 
         if (!region.isGenerator()) {
+            const auto infoStart = std::chrono::steady_clock::now();
             if (!filePool.checkSampleId(*region.sampleId)) {
+                infoMicros += loadMicrosSince(infoStart);
                 removeCurrentRegion();
                 continue;
             }
 
             fileInformation = filePool.getFileInformation(*region.sampleId);
+            infoMicros += loadMicrosSince(infoStart);
+            ++infoFiles;
             if (!fileInformation) {
                 removeCurrentRegion();
                 continue;
@@ -924,6 +953,10 @@ void Synth::Impl::finalizeSfzLoad()
     if (reloading)
         filePool.resetPreloadCallCounts();
 
+    loadTiming[1].store(loadMicrosSince(regionsStart) - infoMicros, std::memory_order_relaxed);
+    loadTiming[2].store(infoMicros, std::memory_order_relaxed);
+    loadTiming[3].store(infoFiles, std::memory_order_relaxed);
+    const auto preloadStart = std::chrono::steady_clock::now();
     {
         // Batch + parallel-decode the preloads (organdroid patch): same semantics as
         // per-file preloadFile(), but a cold load uses every core and reports progress.
@@ -935,6 +968,8 @@ void Synth::Impl::finalizeSfzLoad()
                                     static_cast<uint32_t>(toLoad.second.grow) });
         filePool.preloadFiles(preloadList);
     }
+    loadTiming[4].store(loadMicrosSince(preloadStart), std::memory_order_relaxed);
+    const auto afterStart = std::chrono::steady_clock::now();
 
     // Remove preloaded data with no linked regions
     if (reloading)
@@ -1020,6 +1055,7 @@ void Synth::Impl::finalizeSfzLoad()
                 swLastSlots_.set(key);
         }
     }
+    loadTiming[5].store(loadMicrosSince(afterStart), std::memory_order_relaxed);
 }
 
 bool Synth::loadScalaFile(const fs::path& path)
